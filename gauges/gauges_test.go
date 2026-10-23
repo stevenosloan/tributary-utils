@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fakeNLDI(t *testing.T) *httptest.Server {
@@ -98,6 +99,46 @@ func TestFindNoCatchment(t *testing.T) {
 func TestFindBadCoords(t *testing.T) {
 	if _, err := NewClient(nil).Find(context.Background(), 100, 0, 1); err == nil {
 		t.Fatal("want error")
+	}
+}
+
+func TestFindNLDIFailure(t *testing.T) {
+	// DD fails at once; the other navigations hang until cancelled, so Find
+	// only returns promptly if the failure cancels them.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/comid/position", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"features":[{"geometry":{"type":"LineString","coordinates":[[-105,40],[-105,40.01]]},"properties":{"comid":10}}]}`)
+	})
+	mux.HandleFunc("/comid/10/navigation/DD/nwissite", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream timed out", http.StatusGatewayTimeout)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := NewClient(&Options{BaseURL: srv.URL}).Find(ctx, 40.005, -105, 10)
+	var ne *NLDIError
+	if !errors.As(err, &ne) {
+		t.Fatalf("err = %v, want *NLDIError", err)
+	}
+	if ne.Op != "DD nwissite" || ne.Status != http.StatusGatewayTimeout || !ne.Timeout() {
+		t.Errorf("got op=%q status=%d timeout=%v", ne.Op, ne.Status, ne.Timeout())
+	}
+	if ctx.Err() != nil {
+		t.Error("Find waited on the hung navigations instead of cancelling them")
+	}
+}
+
+func TestFindClientTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	t.Cleanup(srv.Close)
+	c := NewClient(&Options{BaseURL: srv.URL, HTTPClient: &http.Client{Timeout: 50 * time.Millisecond}})
+	_, err := c.Find(context.Background(), 40.005, -105, 10)
+	var ne *NLDIError
+	if !errors.As(err, &ne) || ne.Op != "snap" || ne.Status != 0 || !ne.Timeout() {
+		t.Fatalf("err = %#v, want a snap timeout", err)
 	}
 }
 
