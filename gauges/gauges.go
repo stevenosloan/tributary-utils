@@ -14,10 +14,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +32,26 @@ const DefaultDistanceKm = 25
 // ErrNoCatchment is returned when the point isn't on the NHDPlus network
 // (open ocean, outside the US, etc).
 var ErrNoCatchment = errors.New("gauges: no catchment found at point")
+
+// NLDIError reports a failed NLDI request: which call failed and why.
+type NLDIError struct {
+	Op     string // the call, e.g. "snap", "UT nwissite", "DM flowlines"
+	Status int    // HTTP status; 0 if no response arrived
+	Err    error
+}
+
+func (e *NLDIError) Error() string { return fmt.Sprintf("gauges: NLDI %s: %v", e.Op, e.Err) }
+
+func (e *NLDIError) Unwrap() error { return e.Err }
+
+// Timeout reports whether the call timed out, either waiting on NLDI or with
+// NLDI answering 504 itself.
+func (e *NLDIError) Timeout() bool {
+	var ne net.Error
+	return e.Status == http.StatusGatewayTimeout ||
+		errors.Is(e.Err, context.DeadlineExceeded) ||
+		(errors.As(e.Err, &ne) && ne.Timeout())
+}
 
 // Direction is a gauge's position relative to the query point.
 type Direction string
@@ -141,29 +163,33 @@ func (c *Client) Find(ctx context.Context, lat, lon, distanceKm float64) (*Resul
 	comid := start.reach.COMID
 
 	// UT/DD catch tributary and diversion gauges; UM/DM flowlines give the
-	// mainstem path used to measure network distance.
-	ut, err := c.sites(ctx, comid, "UT", distanceKm)
-	if err != nil {
-		return nil, err
-	}
-	dd, err := c.sites(ctx, comid, "DD", distanceKm)
-	if err != nil {
-		return nil, err
-	}
-	upLine, err := c.flowlines(ctx, comid, "UM", distanceKm)
-	if err != nil {
-		return nil, err
-	}
-	downLine, err := c.flowlines(ctx, comid, "DM", distanceKm)
-	if err != nil {
-		return nil, err
-	}
-
-	var tribs []flowline
-	if c.tribs {
-		if tribs, err = c.flowlines(ctx, comid, "UT", distanceKm); err != nil {
-			return nil, err
+	// mainstem path used to measure network distance. The navigations are
+	// independent, so run them together; the first failure cancels the rest.
+	var (
+		ut, dd                  []feature
+		upLine, downLine, tribs []flowline
+	)
+	sites := func(dst *[]feature, mode string) func(context.Context) error {
+		return func(ctx context.Context) (err error) {
+			*dst, err = c.sites(ctx, comid, mode, distanceKm)
+			return err
 		}
+	}
+	flowlines := func(dst *[]flowline, mode string) func(context.Context) error {
+		return func(ctx context.Context) (err error) {
+			*dst, err = c.flowlines(ctx, comid, mode, distanceKm)
+			return err
+		}
+	}
+	navs := []func(context.Context) error{
+		sites(&ut, "UT"), sites(&dd, "DD"),
+		flowlines(&upLine, "UM"), flowlines(&downLine, "DM"),
+	}
+	if c.tribs {
+		navs = append(navs, flowlines(&tribs, "UT"))
+	}
+	if err := parallel(ctx, navs...); err != nil {
+		return nil, err
 	}
 
 	byID := map[string]*Gauge{}
@@ -227,6 +253,27 @@ func (c *Client) Find(ctx context.Context, lat, lon, distanceKm float64) (*Resul
 
 // --- NLDI plumbing ---
 
+// parallel runs fns concurrently and returns the first error. That error
+// cancels the others, so their resulting context errors are not reported.
+func parallel(ctx context.Context, fns ...func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg    sync.WaitGroup
+		once  sync.Once
+		first error
+	)
+	for _, fn := range fns {
+		wg.Go(func() {
+			if err := fn(ctx); err != nil {
+				once.Do(func() { first = err; cancel() })
+			}
+		})
+	}
+	wg.Wait()
+	return first
+}
+
 type feature struct {
 	Geometry struct {
 		Type        string          `json:"type"`
@@ -266,7 +313,8 @@ func (f feature) gauge() Gauge {
 	return g
 }
 
-func (c *Client) get(ctx context.Context, path string, q url.Values) (*featureCollection, error) {
+// get fetches an NLDI feature collection. op names the call in errors.
+func (c *Client) get(ctx context.Context, op, path string, q url.Values) (*featureCollection, error) {
 	u := c.base + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
@@ -278,22 +326,23 @@ func (c *Client) get(ctx context.Context, path string, q url.Values) (*featureCo
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &NLDIError{Op: op, Err: err}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, err
+		return nil, &NLDIError{Op: op, Status: resp.StatusCode, Err: err}
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrNoCatchment
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gauges: NLDI %s: %s", resp.Status, truncate(string(body), 200))
+		return nil, &NLDIError{Op: op, Status: resp.StatusCode,
+			Err: fmt.Errorf("%s: %s", resp.Status, truncate(string(body), 200))}
 	}
 	var fc featureCollection
 	if err := json.Unmarshal(body, &fc); err != nil {
-		return nil, fmt.Errorf("gauges: decoding NLDI response: %w", err)
+		return nil, &NLDIError{Op: op, Status: resp.StatusCode, Err: fmt.Errorf("decoding response: %w", err)}
 	}
 	return &fc, nil
 }
@@ -309,7 +358,7 @@ type snapped struct {
 func (c *Client) snap(ctx context.Context, lat, lon float64) (snapped, error) {
 	// WKT order is lon lat.
 	q := url.Values{"coords": {fmt.Sprintf("POINT(%v %v)", lon, lat)}}
-	fc, err := c.get(ctx, "/comid/position", q)
+	fc, err := c.get(ctx, "snap", "/comid/position", q)
 	if err != nil {
 		return snapped{}, err
 	}
@@ -326,7 +375,7 @@ func (c *Client) snap(ctx context.Context, lat, lon float64) (snapped, error) {
 
 func (c *Client) sites(ctx context.Context, comid int, mode string, km float64) ([]feature, error) {
 	path := fmt.Sprintf("/comid/%d/navigation/%s/nwissite", comid, mode)
-	fc, err := c.get(ctx, path, url.Values{"distance": {fmt.Sprint(km)}})
+	fc, err := c.get(ctx, mode+" nwissite", path, url.Values{"distance": {fmt.Sprint(km)}})
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +391,7 @@ type flowline struct {
 // flowlines returns the mainstem path in network order from the start reach.
 func (c *Client) flowlines(ctx context.Context, comid int, mode string, km float64) ([]flowline, error) {
 	path := fmt.Sprintf("/comid/%d/navigation/%s/flowlines", comid, mode)
-	fc, err := c.get(ctx, path, url.Values{"distance": {fmt.Sprint(km)}})
+	fc, err := c.get(ctx, mode+" flowlines", path, url.Values{"distance": {fmt.Sprint(km)}})
 	if err != nil {
 		return nil, err
 	}

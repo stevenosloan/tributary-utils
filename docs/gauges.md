@@ -49,6 +49,9 @@ flowchart TD
 3. **Get the mainstem path.** Navigate `UM` and `DM` with
    `dataSource=flowlines`. These are the ordered reaches, with geometry, used
    to measure distance.
+
+   Steps 2 and 3 only need the COMID, so their requests run concurrently;
+   the first failure cancels the rest.
 4. **Tag and measure each gauge**, deduplicated by ID:
    - **Different reach, on the mainstem path.** Direction comes from which
      query returned it. `NetworkKm` = rest of the start reach (from `posKm`) +
@@ -137,6 +140,15 @@ network.
 `Result` also carries the geometry it was computed from (`Reach`, `UpPath`,
 `DownPath`, and `Tributaries` when `Options.Tributaries` is set) plus the query
 inputs, so a result can be drawn without more requests.
+
+## Errors
+
+- `ErrNoCatchment`: the point isn't on the NHDPlus network (NLDI 404).
+- `*NLDIError`: an NLDI request failed. `Op` names the call (`snap`,
+  `UT nwissite`, `DM flowlines`, ...), `Status` is the HTTP status (0 when no
+  response arrived), and `Timeout()` reports whether it timed out, either on
+  our side or as an NLDI 504. NLDI is often slow; a single call can take 20s
+  or more. The default client allows 30s per request.
 
 ## Drawing a result
 
