@@ -96,6 +96,29 @@ func TestFindNoCatchment(t *testing.T) {
 	}
 }
 
+func TestSnap(t *testing.T) {
+	srv := fakeNLDI(t)
+	c := NewClient(&Options{BaseURL: srv.URL})
+	s, err := c.Snap(context.Background(), 40.005, -105)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.COMID != 10 || len(s.Reach) != 2 || s.Lat != 40.005 || s.Lon != -105 || s.SnapKm > 0.01 {
+		t.Fatalf("snap = %+v", s)
+	}
+}
+
+func TestSnapNoCatchment(t *testing.T) {
+	srv := fakeNLDI(t)
+	c := NewClient(&Options{BaseURL: srv.URL})
+	if _, err := c.Snap(context.Background(), 30, -30); !errors.Is(err, ErrNoCatchment) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := c.Snap(context.Background(), 100, 0); err == nil {
+		t.Fatal("want error for bad coords")
+	}
+}
+
 func TestFindBadCoords(t *testing.T) {
 	if _, err := NewClient(nil).Find(context.Background(), 100, 0, 1); err == nil {
 		t.Fatal("want error")

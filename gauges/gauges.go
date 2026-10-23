@@ -149,8 +149,8 @@ func NewClient(opts *Options) *Client {
 // Find returns gauges within distanceKm along the network of the point, tagged
 // upstream or downstream. distanceKm <= 0 uses DefaultDistanceKm.
 func (c *Client) Find(ctx context.Context, lat, lon, distanceKm float64) (*Result, error) {
-	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
-		return nil, fmt.Errorf("gauges: invalid coordinates %v,%v", lat, lon)
+	if err := checkCoords(lat, lon); err != nil {
+		return nil, err
 	}
 	if distanceKm <= 0 {
 		distanceKm = DefaultDistanceKm
@@ -345,6 +345,41 @@ func (c *Client) get(ctx context.Context, op, path string, q url.Values) (*featu
 		return nil, &NLDIError{Op: op, Status: resp.StatusCode, Err: fmt.Errorf("decoding response: %w", err)}
 	}
 	return &fc, nil
+}
+
+// Snap is a point placed on the river network.
+type Snap struct {
+	// Query echoes the inputs.
+	Lat, Lon float64
+
+	COMID int
+	// SnapKm is the distance from the point to the reach. NLDI picks the reach
+	// whose catchment contains the point, not the nearest stream, so a large
+	// value means the point may be on a different stream than intended.
+	SnapKm float64
+	// Reach is the snapped reach, upstream to downstream.
+	Reach Line
+}
+
+// Snap resolves a point to its NHDPlus reach without navigating the network,
+// in one NLDI request. It fails as Find does: ErrNoCatchment off the network,
+// an *NLDIError (Op "snap") when NLDI fails.
+func (c *Client) Snap(ctx context.Context, lat, lon float64) (*Snap, error) {
+	if err := checkCoords(lat, lon); err != nil {
+		return nil, err
+	}
+	s, err := c.snap(ctx, lat, lon)
+	if err != nil {
+		return nil, err
+	}
+	return &Snap{Lat: lat, Lon: lon, COMID: s.reach.COMID, SnapKm: s.snapKm, Reach: s.reach.Coords}, nil
+}
+
+func checkCoords(lat, lon float64) error {
+	if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return fmt.Errorf("gauges: invalid coordinates %v,%v", lat, lon)
+	}
+	return nil
 }
 
 // snapped is the query point placed on its flowline.

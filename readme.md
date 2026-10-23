@@ -32,6 +32,9 @@ for _, g := range res.Gauges {
 }
 ```
 
+`c.Snap(ctx, lat, lon)` only finds the river reach the point lands on (one
+request), with `SnapKm` to check it's the stream you meant.
+
 ### Docs
 
 How it works, the algorithm, diagrams, and known limits: [docs/gauges.md](docs/gauges.md).
