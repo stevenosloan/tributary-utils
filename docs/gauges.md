@@ -42,6 +42,11 @@ flowchart TD
    - `SnapKm`: distance from the point to the stream, for sanity-checking.
    - `posKm`: distance from the reach's upstream end to the snapped point.
    A point off the network returns 404, surfaced as `ErrNoCatchment`.
+   "Containing" means the NHDPlus catchment the point falls in, i.e. the land
+   that drains to that reach. Between two streams the dividing line is the
+   drainage divide, not the midpoint, so the reach isn't always the nearest
+   stream. `Client.Snap` runs only this step, for showing which reach a point
+   lands on before searching.
 2. **Find gauges.** From the COMID, navigate with `dataSource=nwissite` and a
    capped `distance`:
    - `UT` (upstream + tributaries) -> upstream gauges
@@ -137,6 +142,9 @@ network.
 | `Gauge.SiteNo` | ID without `USGS-`, for NWIS data lookups |
 | `Gauge.URL` | waterdata.usgs.gov monitoring-location page |
 
+`Client.Snap` returns a `Snap` with the same `COMID`, `SnapKm` and `Reach`, from
+one request.
+
 `Result` also carries the geometry it was computed from (`Reach`, `UpPath`,
 `DownPath`, and `Tributaries` when `Options.Tributaries` is set) plus the query
 inputs, so a result can be drawn without more requests.
@@ -179,8 +187,11 @@ which gauges are returned. The table is capped at `render.Options.MaxRows`
   so tags and distances within a reach are approximate (not riffle-scale).
   `measure` is assumed linear in length.
 - **Coverage.** Only gauges indexed to the network appear; some won't.
-- **Wrong snaps.** A point near two streams can snap to the wrong one; check
-  `SnapKm`.
+- **Wrong snaps.** A point snaps to the reach whose catchment contains it, so
+  it can land on a different stream than the nearest one: across a ridge,
+  near a confluence, or on a small creek that isn't in NHDPlusV2 (which then
+  maps to the reach it drains into). A large `SnapKm` is the signal; show
+  users the snapped reach so they can move the point.
 - **Tributary gauges** have no network distance.
 - **Reported errors.** Direction and position can still be wrong in practice
   (see the site notes on letting users report bad gauge locations).
