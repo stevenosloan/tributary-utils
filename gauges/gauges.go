@@ -12,15 +12,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/stevenosloan/tributary-utils/internal/httpx"
 )
 
 // DefaultBaseURL is the NLDI host (moved from labs.waterdata.usgs.gov in 2024).
@@ -46,12 +45,7 @@ func (e *NLDIError) Unwrap() error { return e.Err }
 
 // Timeout reports whether the call timed out, either waiting on NLDI or with
 // NLDI answering 504 itself.
-func (e *NLDIError) Timeout() bool {
-	var ne net.Error
-	return e.Status == http.StatusGatewayTimeout ||
-		errors.Is(e.Err, context.DeadlineExceeded) ||
-		(errors.As(e.Err, &ne) && ne.Timeout())
-}
+func (e *NLDIError) Timeout() bool { return httpx.Timeout(e.Status, e.Err) }
 
 // Direction is a gauge's position relative to the query point.
 type Direction string
@@ -188,7 +182,7 @@ func (c *Client) Find(ctx context.Context, lat, lon, distanceKm float64) (*Resul
 	if c.tribs {
 		navs = append(navs, flowlines(&tribs, "UT"))
 	}
-	if err := parallel(ctx, navs...); err != nil {
+	if err := httpx.Parallel(ctx, 0, navs...); err != nil {
 		return nil, err
 	}
 
@@ -253,27 +247,6 @@ func (c *Client) Find(ctx context.Context, lat, lon, distanceKm float64) (*Resul
 
 // --- NLDI plumbing ---
 
-// parallel runs fns concurrently and returns the first error. That error
-// cancels the others, so their resulting context errors are not reported.
-func parallel(ctx context.Context, fns ...func(context.Context) error) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var (
-		wg    sync.WaitGroup
-		once  sync.Once
-		first error
-	)
-	for _, fn := range fns {
-		wg.Go(func() {
-			if err := fn(ctx); err != nil {
-				once.Do(func() { first = err; cancel() })
-			}
-		})
-	}
-	wg.Wait()
-	return first
-}
-
 type feature struct {
 	Geometry struct {
 		Type        string          `json:"type"`
@@ -319,30 +292,19 @@ func (c *Client) get(ctx context.Context, op, path string, q url.Values) (*featu
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	status, body, err := httpx.Get(ctx, c.hc, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, &NLDIError{Op: op, Status: status, Err: err}
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, &NLDIError{Op: op, Err: err}
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return nil, &NLDIError{Op: op, Status: resp.StatusCode, Err: err}
-	}
-	if resp.StatusCode == http.StatusNotFound {
+	if status == http.StatusNotFound {
 		return nil, ErrNoCatchment
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, &NLDIError{Op: op, Status: resp.StatusCode,
-			Err: fmt.Errorf("%s: %s", resp.Status, truncate(string(body), 200))}
+	if status != http.StatusOK {
+		return nil, &NLDIError{Op: op, Status: status, Err: httpx.StatusError(status, body)}
 	}
 	var fc featureCollection
 	if err := json.Unmarshal(body, &fc); err != nil {
-		return nil, &NLDIError{Op: op, Status: resp.StatusCode, Err: fmt.Errorf("decoding response: %w", err)}
+		return nil, &NLDIError{Op: op, Status: status, Err: fmt.Errorf("decoding response: %w", err)}
 	}
 	return &fc, nil
 }
@@ -536,11 +498,4 @@ func haversineKm(lat1, lon1, lat2, lon2 float64) float64 {
 	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
 		math.Cos(lat1*rad)*math.Cos(lat2*rad)*math.Sin(dLon/2)*math.Sin(dLon/2)
 	return 2 * r * math.Asin(math.Sqrt(a))
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }

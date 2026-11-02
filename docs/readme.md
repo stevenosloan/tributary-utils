@@ -11,6 +11,7 @@ utils/
 │   ├── gauges.go
 │   ├── gauges_test.go
 │   └── render/      # package render: Result -> SVG drawing
+├── readings/        # package readings: gauge site numbers -> latest values
 ├── cmd/
 │   └── gauges/      # CLI: table/JSON output, -svg to draw
 └── docs/            # you are here
@@ -22,12 +23,14 @@ thin wrapper over its package.
 | Doc | Covers |
 |-----|--------|
 | [gauges.md](gauges.md) | How `gauges.Find` works, data sources, drawing, known limits |
+| [readings.md](readings.md) | Latest gauge readings: source, what comes back, API key |
 
 ## Testing
 
 ```sh
-go test ./...                                  # unit tests, fake NLDI server
-TRIBUTARY_LIVE=1 go test -run Live -v ./gauges # hits the real NLDI
+go test ./...                                    # unit tests, fake servers
+TRIBUTARY_LIVE=1 go test -run Live -v ./gauges   # hits the real NLDI
+TRIBUTARY_LIVE=1 go test -run Live -v ./readings # hits the real Water Data API
 go run ./cmd/gauges -links <lat> <lon>         # manual inspection
 go run ./cmd/gauges -svg out.svg <lat> <lon>   # draw the result
 ```
