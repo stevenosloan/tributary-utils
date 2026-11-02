@@ -139,7 +139,7 @@ network.
 | `Gauge.StraightKm` | Great-circle distance |
 | `Gauge.Mainstem` | On the mainstem path from the point |
 | `Gauge.Via` | Which navigations returned it: `UT`, `DD`. Start-reach gauges show both |
-| `Gauge.SiteNo` | ID without `USGS-`, for NWIS data lookups |
+| `Gauge.SiteNo` | ID without `USGS-`, for reading lookups ([readings.md](readings.md)) |
 | `Gauge.URL` | waterdata.usgs.gov monitoring-location page |
 
 `Client.Snap` returns a `Snap` with the same `COMID`, `SnapKm` and `Reach`, from
@@ -198,7 +198,5 @@ which gauges are returned. The table is capped at `render.Options.MaxRows`
 
 ## Not yet implemented
 
-- Fetching readings (flow `00060`, gage height `00065`, water temp `00010`),
-  including filtering sentinel values like `-999999`.
 - HUC-12 cross-check via the Monitoring Locations API.
 - NWS weather.

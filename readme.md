@@ -38,3 +38,19 @@ request), with `SnapKm` to check it's the stream you meant.
 ### Docs
 
 How it works, the algorithm, diagrams, and known limits: [docs/gauges.md](docs/gauges.md).
+
+## readings
+
+The latest value of every series a USGS gauge reports (flow, gage height,
+water temperature, and anything else it measures), from the USGS Water Data
+API. An API key is optional.
+
+```go
+c := readings.NewClient(nil)
+got, err := c.Latest(ctx, []string{"01646500"}) // gauges.Gauge.SiteNo values
+for _, r := range got["01646500"] {
+	fmt.Println(r.Parameter, r.Value, r.Unit, r.Time, r.Discontinued)
+}
+```
+
+Details: [docs/readings.md](docs/readings.md).
