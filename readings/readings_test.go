@@ -30,15 +30,15 @@ func value(series, site, code, val string) string {
 		series, site, code, val)
 }
 
-func meta(series, name, subloc, desc string) string {
+func meta(series, site, name, subloc, desc string) string {
 	null := func(s string) string {
 		if s == "" {
 			return "null"
 		}
 		return fmt.Sprintf("%q", s)
 	}
-	return fmt.Sprintf(`{"id":%q,"parameter_name":%q,"sublocation_identifier":%s,"web_description":%s}`,
-		series, name, null(subloc), null(desc))
+	return fmt.Sprintf(`{"id":%q,"monitoring_location_id":"USGS-%s","parameter_name":%q,"sublocation_identifier":%s,"web_description":%s}`,
+		series, site, name, null(subloc), null(desc))
 }
 
 // fakeAPI serves two gauges: "a" with discharge, two water temperature
@@ -65,15 +65,16 @@ func fakeAPI(t *testing.T) (*httptest.Server, *[]*http.Request) {
 			value("a3", "a", "00010", `"24.3"`),
 			value("a4", "a", "00095", `"-999999"`),
 			value("a5", "a", "00300", `null`),
+			value("a6", "a", "00400", `"NaN"`),
 		))
 	})
 	mux.HandleFunc("/collections/time-series-metadata/items", func(w http.ResponseWriter, r *http.Request) {
 		record(r)
 		fmt.Fprint(w, fc("",
-			meta("a1", "Discharge", "", ""),
-			meta("a2", "Temperature, water", "From multiparameter sonde", ""),
-			meta("a3", "Temperature, water", "1.0 ft from riverbed (bottom)", "Discontinued"),
-			meta("b1", "Gage height", "", ""),
+			meta("a1", "a", "Discharge", "", ""),
+			meta("a2", "a", "Temperature, water", "From multiparameter sonde", ""),
+			meta("a3", "a", "Temperature, water", "1.0 ft from riverbed (bottom)", "Discontinued 2017"),
+			meta("b1", "b", "Gage height", "", ""),
 		))
 	})
 	srv = httptest.NewServer(mux)
@@ -183,6 +184,152 @@ func TestLatestErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLatestBatchesSites(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		asked = map[string]int{}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ids := strings.Split(r.URL.Query().Get("monitoring_location_id"), ",")
+		if len(ids) > sitesPerRequest {
+			t.Errorf("%s: %d sites in one request", r.URL.Path, len(ids))
+		}
+		mu.Lock()
+		for _, id := range ids {
+			asked[r.URL.Path+" "+id]++
+		}
+		mu.Unlock()
+		fmt.Fprint(w, fc(""))
+	}))
+	defer srv.Close()
+
+	sites := make([]string, 2*sitesPerRequest+50)
+	for i := range sites {
+		sites[i] = fmt.Sprintf("%08d", i)
+	}
+	if _, err := NewClient(&Options{BaseURL: srv.URL}).Latest(context.Background(), sites); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/collections/latest-continuous/items", "/collections/time-series-metadata/items"} {
+		for _, s := range sites {
+			if n := asked[path+" USGS-"+s]; n != 1 {
+				t.Fatalf("%s: site %s asked %d times, want 1", path, s, n)
+			}
+		}
+	}
+}
+
+func TestLatestNextLinks(t *testing.T) {
+	var elsewhere int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhere++
+		fmt.Fprint(w, fc(""))
+	}))
+	defer other.Close()
+
+	tests := []struct {
+		name    string
+		next    func(self string) string
+		wantErr bool
+	}{
+		// Some servers repeat the current page as next on the last page.
+		{name: "repeats", next: func(self string) string { return self }},
+		{name: "other host", wantErr: true, next: func(string) string { return other.URL + "/items" }},
+		{name: "other scheme", wantErr: true, next: func(self string) string { return strings.Replace(self, "http:", "https:", 1) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var srv *httptest.Server
+			pages := 0
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/collections/time-series-metadata/items" {
+					fmt.Fprint(w, fc(""))
+					return
+				}
+				pages++
+				fmt.Fprint(w, fc(tt.next(srv.URL+r.URL.RequestURI()), value("a1", "a", "00060", `"240"`)))
+			}))
+			defer srv.Close()
+			got, err := NewClient(&Options{BaseURL: srv.URL, APIKey: "k"}).Latest(context.Background(), []string{"a"})
+			if tt.wantErr {
+				var re *Error
+				if !errors.As(err, &re) || re.Op != "latest-continuous" {
+					t.Fatalf("got %v, want *Error for latest-continuous", err)
+				}
+			} else if err != nil || len(got["a"]) != 1 || pages != 1 {
+				t.Fatalf("got %v, %v after %d pages; want one reading from one page", got, err, pages)
+			}
+			if elsewhere != 0 {
+				t.Errorf("followed a next link to another host")
+			}
+		})
+	}
+}
+
+func TestLatestCachesMetadata(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		metaReqs []string
+		series   = []string{value("a1", "a", "00060", `"240"`)}
+		metas    = []string{meta("a1", "a", "Discharge", "", "")}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/collections/time-series-metadata/items" {
+			metaReqs = append(metaReqs, r.URL.Query().Get("monitoring_location_id"))
+			fmt.Fprint(w, fc("", metas...))
+			return
+		}
+		fmt.Fprint(w, fc("", series...))
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	c := NewClient(&Options{BaseURL: srv.URL})
+	c.now = func() time.Time { return now }
+	latest := func(sites ...string) map[string][]Reading {
+		t.Helper()
+		got, err := c.Latest(context.Background(), sites)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	wantMeta := func(want ...string) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		if fmt.Sprint(metaReqs) != fmt.Sprint(want) {
+			t.Errorf("metadata requests = %q, want %q", metaReqs, want)
+		}
+		metaReqs = nil
+	}
+
+	latest("a", "b")
+	wantMeta("USGS-a,USGS-b")
+
+	// Cached, including b, which has no series.
+	if got := latest("a", "b"); got["a"][0].Parameter != "Discharge" {
+		t.Errorf("cached reading = %+v", got["a"][0])
+	}
+	wantMeta()
+
+	// A new series at a refetches only that gauge.
+	mu.Lock()
+	series = append(series, value("a2", "a", "00065", `"3.1"`))
+	metas = append(metas, meta("a2", "a", "Gage height", "", ""))
+	mu.Unlock()
+	if got := latest("a", "b"); len(got["a"]) != 2 || got["a"][1].Parameter != "Gage height" {
+		t.Errorf("after new series = %+v", got["a"])
+	}
+	wantMeta("USGS-a")
+
+	now = now.Add(metaTTL)
+	latest("a", "b")
+	wantMeta("USGS-a,USGS-b")
 }
 
 // Live check against the real Water Data API; run with TRIBUTARY_LIVE=1.

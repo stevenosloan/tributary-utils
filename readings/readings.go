@@ -10,17 +10,18 @@ package readings
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net"
+	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/stevenosloan/tributary-utils/internal/httpx"
 )
 
 // DefaultBaseURL is the USGS Water Data OGC API, which replaces the legacy
@@ -32,6 +33,17 @@ const sentinel = -999999
 
 // pageLimit is the page size requested; the API rejects more than 50000.
 const pageLimit = 10000
+
+// sitesPerRequest caps how many sites go in one request's query string, which
+// otherwise outgrows the server's URL length limit for a large gauges.Find
+// result.
+const sitesPerRequest = 100
+
+// maxConcurrent caps requests in flight at once for one Latest call.
+const maxConcurrent = 4
+
+// metaTTL is how long a gauge's series metadata is cached.
+const metaTTL = 24 * time.Hour
 
 // Error reports a failed request to the Water Data API.
 type Error struct {
@@ -46,12 +58,7 @@ func (e *Error) Unwrap() error { return e.Err }
 
 // Timeout reports whether the call timed out, either waiting on the API or
 // with the API answering 504 itself.
-func (e *Error) Timeout() bool {
-	var ne net.Error
-	return e.Status == http.StatusGatewayTimeout ||
-		errors.Is(e.Err, context.DeadlineExceeded) ||
-		(errors.As(e.Err, &ne) && ne.Timeout())
-}
+func (e *Error) Timeout() bool { return httpx.Timeout(e.Status, e.Err) }
 
 // Reading is the latest value of one time series at a gauge.
 type Reading struct {
@@ -80,16 +87,27 @@ type Options struct {
 	APIKey string
 }
 
-// Client queries the Water Data API.
+// Client queries the Water Data API. It is safe for concurrent use.
 type Client struct {
 	base string
 	hc   *http.Client
 	key  string
+
+	now  func() time.Time
+	mu   sync.Mutex
+	meta map[string]siteMeta // keyed by monitoring location ID, "USGS-..."
+}
+
+// siteMeta is a gauge's cached series metadata, keyed by series ID.
+type siteMeta struct {
+	fetched time.Time
+	series  map[string]metaProps
 }
 
 // NewClient returns a Client; a nil opts uses defaults.
 func NewClient(opts *Options) *Client {
-	c := &Client{base: DefaultBaseURL, hc: &http.Client{Timeout: 30 * time.Second}}
+	c := &Client{base: DefaultBaseURL, hc: &http.Client{Timeout: 30 * time.Second},
+		now: time.Now, meta: map[string]siteMeta{}}
 	if opts != nil {
 		if opts.BaseURL != "" {
 			c.base = strings.TrimRight(opts.BaseURL, "/")
@@ -108,6 +126,10 @@ func NewClient(opts *Options) *Client {
 // Readings with a missing value are left out. Each gauge's readings are
 // sorted by parameter code, then active before discontinued, then
 // sublocation.
+//
+// Series metadata (names, sublocations, status) is cached on the Client for
+// 24 hours per gauge, and fetched again sooner if a gauge reports a series
+// the cache doesn't know.
 func (c *Client) Latest(ctx context.Context, siteNos []string) (map[string][]Reading, error) {
 	out := map[string][]Reading{}
 	if len(siteNos) == 0 {
@@ -117,38 +139,63 @@ func (c *Client) Latest(ctx context.Context, siteNos []string) (map[string][]Rea
 	for i, s := range siteNos {
 		ids[i] = "USGS-" + strings.TrimPrefix(s, "USGS-")
 	}
-	sites := strings.Join(ids, ",")
 
-	// Values and metadata (names, sublocations, status) come from separate
-	// collections, joined on the series ID.
+	// Values and metadata come from separate collections, joined on the
+	// series ID. Metadata is only fetched for gauges not cached.
+	known, stale := c.cachedMeta(ids)
 	var (
-		values []valueProps
-		meta   []metaProps
+		values = make([][]valueProps, len(chunk(ids)))
+		meta   = make([][]metaProps, len(chunk(stale)))
+		fns    []func(context.Context) error
 	)
-	err := parallel(ctx,
-		func(ctx context.Context) error {
-			return fetch(ctx, c, "latest-continuous", url.Values{"monitoring_location_id": {sites}}, &values)
-		},
-		func(ctx context.Context) error {
-			q := url.Values{"monitoring_location_id": {sites}, "computation_period_identifier": {"Points"}}
-			return fetch(ctx, c, "time-series-metadata", q, &meta)
-		},
-	)
-	if err != nil {
+	for i, sites := range chunk(ids) {
+		fns = append(fns, func(ctx context.Context) error {
+			return fetch(ctx, c, "latest-continuous", url.Values{"monitoring_location_id": {sites}}, &values[i])
+		})
+	}
+	for i, sites := range chunk(stale) {
+		fns = append(fns, c.fetchMeta(sites, &meta[i]))
+	}
+	if err := httpx.Parallel(ctx, maxConcurrent, fns...); err != nil {
 		return nil, err
 	}
 
-	byID := make(map[string]metaProps, len(meta))
-	for _, m := range meta {
-		byID[m.ID] = m
-	}
-	for _, v := range values {
-		r, ok := v.reading(byID[v.SeriesID])
-		if !ok {
-			continue
+	// A cached gauge reporting a series the cache doesn't know has a new
+	// series; refetch its metadata.
+	var recheck []string
+	for _, vs := range values {
+		for _, v := range vs {
+			if m, ok := known[v.Site]; ok && !slices.Contains(recheck, v.Site) {
+				if _, ok := m.series[v.SeriesID]; !ok {
+					recheck = append(recheck, v.Site)
+				}
+			}
 		}
-		site := strings.TrimPrefix(v.Site, "USGS-")
-		out[site] = append(out[site], r)
+	}
+	if len(recheck) > 0 {
+		more := make([][]metaProps, len(chunk(recheck)))
+		fns = fns[:0]
+		for i, sites := range chunk(recheck) {
+			fns = append(fns, c.fetchMeta(sites, &more[i]))
+		}
+		if err := httpx.Parallel(ctx, maxConcurrent, fns...); err != nil {
+			return nil, err
+		}
+		meta = append(meta, more...)
+	}
+	for site, m := range c.storeMeta(append(stale, recheck...), meta, values) {
+		known[site] = m
+	}
+
+	for _, vs := range values {
+		for _, v := range vs {
+			r, ok := v.reading(known[v.Site].series[v.SeriesID])
+			if !ok {
+				continue
+			}
+			site := strings.TrimPrefix(v.Site, "USGS-")
+			out[site] = append(out[site], r)
+		}
 	}
 	for _, rs := range out {
 		sort.SliceStable(rs, func(i, j int) bool {
@@ -165,6 +212,79 @@ func (c *Client) Latest(ctx context.Context, siteNos []string) (map[string][]Rea
 	return out, nil
 }
 
+// chunk splits ids into comma-joined groups of at most sitesPerRequest.
+func chunk(ids []string) []string {
+	var out []string
+	for len(ids) > 0 {
+		n := min(len(ids), sitesPerRequest)
+		out = append(out, strings.Join(ids[:n], ","))
+		ids = ids[n:]
+	}
+	return out
+}
+
+func (c *Client) fetchMeta(sites string, dst *[]metaProps) func(context.Context) error {
+	return func(ctx context.Context) error {
+		q := url.Values{"monitoring_location_id": {sites}, "computation_period_identifier": {"Points"}}
+		return fetch(ctx, c, "time-series-metadata", q, dst)
+	}
+}
+
+// cachedMeta splits ids into gauges with fresh cached metadata and stale ones
+// that need fetching.
+func (c *Client) cachedMeta(ids []string) (known map[string]siteMeta, stale []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	known = map[string]siteMeta{}
+	seen := map[string]bool{}
+	now := c.now()
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if m, ok := c.meta[id]; ok && now.Sub(m.fetched) < metaTTL {
+			known[id] = m
+		} else {
+			stale = append(stale, id)
+		}
+	}
+	return known, stale
+}
+
+// storeMeta caches the metadata fetched for sites and returns it by site. A
+// value whose series has no metadata gets an empty entry, so it isn't taken
+// for a new series on the next call.
+func (c *Client) storeMeta(sites []string, meta [][]metaProps, values [][]valueProps) map[string]siteMeta {
+	now := c.now()
+	got := make(map[string]siteMeta, len(sites))
+	for _, s := range sites {
+		got[s] = siteMeta{fetched: now, series: map[string]metaProps{}}
+	}
+	for _, ms := range meta {
+		for _, m := range ms {
+			if sm, ok := got[m.Site]; ok {
+				sm.series[m.ID] = m
+			}
+		}
+	}
+	for _, vs := range values {
+		for _, v := range vs {
+			if sm, ok := got[v.Site]; ok {
+				if _, ok := sm.series[v.SeriesID]; !ok {
+					sm.series[v.SeriesID] = metaProps{ID: v.SeriesID, Site: v.Site}
+				}
+			}
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for s, m := range got {
+		c.meta[s] = m
+	}
+	return got
+}
+
 type valueProps struct {
 	SeriesID   string   `json:"time_series_id"`
 	Site       string   `json:"monitoring_location_id"`
@@ -178,6 +298,7 @@ type valueProps struct {
 
 type metaProps struct {
 	ID          string  `json:"id"`
+	Site        string  `json:"monitoring_location_id"`
 	Name        string  `json:"parameter_name"`
 	Sublocation *string `json:"sublocation_identifier"`
 	Description *string `json:"web_description"`
@@ -190,7 +311,7 @@ func (v valueProps) reading(m metaProps) (r Reading, ok bool) {
 		return r, false
 	}
 	val, err := strconv.ParseFloat(*v.Value, 64)
-	if err != nil || val == sentinel {
+	if err != nil || val == sentinel || math.IsNaN(val) || math.IsInf(val, 0) {
 		return r, false
 	}
 	t, err := time.Parse(time.RFC3339, v.Time)
@@ -205,7 +326,9 @@ func (v valueProps) reading(m metaProps) (r Reading, ok bool) {
 	if m.Sublocation != nil {
 		r.Sublocation = *m.Sublocation
 	}
-	r.Discontinued = m.Description != nil && strings.EqualFold(*m.Description, "Discontinued")
+	// web_description is free text; USGS writes "Discontinued" but may add to it.
+	r.Discontinued = m.Description != nil &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(*m.Description)), "discontinued")
 	for _, q := range v.Qualifiers {
 		if strings.EqualFold(q, "DISCONTINUED") {
 			r.Discontinued = true
@@ -224,12 +347,16 @@ type page[T any] struct {
 	} `json:"links"`
 }
 
-// fetch reads every page of a collection's items matching q into dst.
+// fetch reads every page of a collection's items matching q into dst. It
+// follows next links only on the base URL's scheme and host, since each
+// request carries the API key, and stops at a link it has already followed.
 func fetch[T any](ctx context.Context, c *Client, op string, q url.Values, dst *[]T) error {
 	q.Set("f", "json")
 	q.Set("limit", strconv.Itoa(pageLimit))
 	u := c.base + "/collections/" + op + "/items?" + q.Encode()
-	for u != "" {
+	seen := map[string]bool{}
+	for u != "" && !seen[u] {
+		seen[u] = true
 		var p page[T]
 		if err := c.get(ctx, op, u, &p); err != nil {
 			return err
@@ -243,62 +370,37 @@ func fetch[T any](ctx context.Context, c *Client, op string, q url.Values, dst *
 				u = l.Href
 			}
 		}
+		if u != "" && !c.onBase(u) {
+			return &Error{Op: op, Err: fmt.Errorf("next link %q is not on %s", httpx.Truncate(u, 200), c.base)}
+		}
 	}
 	return nil
+}
+
+// onBase reports whether u has the base URL's scheme and host.
+func (c *Client) onBase(u string) bool {
+	pu, err := url.Parse(u)
+	if err != nil {
+		return false
+	}
+	b, err := url.Parse(c.base)
+	return err == nil && pu.Scheme == b.Scheme && strings.EqualFold(pu.Host, b.Host)
 }
 
 func (c *Client) get(ctx context.Context, op, u string, dst any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
+	var h http.Header
 	if c.key != "" {
-		req.Header.Set("X-Api-Key", c.key)
+		h = http.Header{"X-Api-Key": {c.key}}
 	}
-	resp, err := c.hc.Do(req)
+	status, body, err := httpx.Get(ctx, c.hc, u, h)
 	if err != nil {
-		return &Error{Op: op, Err: err}
+		return &Error{Op: op, Status: status, Err: err}
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return &Error{Op: op, Status: resp.StatusCode, Err: err}
-	}
-	if resp.StatusCode != http.StatusOK {
-		return &Error{Op: op, Status: resp.StatusCode,
-			Err: fmt.Errorf("%s: %s", resp.Status, truncate(string(body), 200))}
+	if status != http.StatusOK {
+		return &Error{Op: op, Status: status, Err: httpx.StatusError(status, body)}
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		return &Error{Op: op, Status: resp.StatusCode, Err: fmt.Errorf("decoding response: %w", err)}
+		return &Error{Op: op, Status: status, Err: fmt.Errorf("decoding response: %w", err)}
 	}
 	return nil
-}
-
-// parallel runs fns concurrently; the first error cancels the rest and is
-// returned.
-func parallel(ctx context.Context, fns ...func(context.Context) error) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var (
-		wg    sync.WaitGroup
-		once  sync.Once
-		first error
-	)
-	for _, fn := range fns {
-		wg.Go(func() {
-			if err := fn(ctx); err != nil {
-				once.Do(func() { first = err; cancel() })
-			}
-		})
-	}
-	wg.Wait()
-	return first
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
