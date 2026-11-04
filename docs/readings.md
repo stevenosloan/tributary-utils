@@ -15,6 +15,17 @@ for _, r := range got["01646500"] {
 Site numbers are the `gauges.Gauge.SiteNo` values (a `USGS-` prefix is also
 accepted), so a `gauges.Find` result feeds straight in.
 
+For past values, `History` returns a gauge's 15-minute values of one
+parameter over a window:
+
+```go
+end := time.Now()
+vs, err := c.History(ctx, "02390000", "00060", end.Add(-6*time.Hour), end)
+for _, v := range vs {
+	fmt.Println(v.Time, v.Value, v.Unit, v.Approval, v.SeriesID)
+}
+```
+
 ## Source
 
 The USGS Water Data OGC API, `https://api.waterdata.usgs.gov/ogcapi/v1`
@@ -34,6 +45,26 @@ The two are joined on the series ID. Results are paged: `next` links are
 followed, but only on the same scheme and host as the base URL (a link
 elsewhere is an `*Error`, so the API key isn't sent off-site), and a link
 already followed ends the paging.
+
+### History
+
+`History` reads one collection:
+
+| Op (`Error.Op`) | Request | Gives |
+|-----------------|---------|-------|
+| `continuous` | `GET /collections/continuous/items?monitoring_location_id=USGS-<site>&parameter_code=<code>&time=<start>/<end>` | Every value in the window: time, value, unit, approval, qualifiers, series ID |
+
+Times are sent as UTC RFC 3339. Paging, the API key and next-link checks work
+as for `Latest`. The API sends values as strings; they are parsed, and values
+that are missing, `NaN`, infinite or `-999999` are left out, as in `Latest`.
+Results are sorted by time, and a window with no values gives an empty slice,
+not an error. An empty site or parameter code, or a `start` not before `end`,
+is an `*Error` without a request.
+
+A gauge with several sensors for the parameter returns the values of all of
+them, told apart by `Value.SeriesID`; filter on it to pick one. Series
+metadata isn't fetched, so there is no sublocation here; a long window of
+15-minute values is many rows (a day is 96 per series).
 
 ### Metadata cache
 

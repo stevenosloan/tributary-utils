@@ -350,3 +350,135 @@ func TestLatestLive(t *testing.T) {
 		t.Fatal("no readings")
 	}
 }
+
+func TestHistory(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		reqs []*http.Request
+	)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/collections/continuous/items" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		reqs = append(reqs, r)
+		mu.Unlock()
+		hv := func(series, tm, val string) string {
+			return fmt.Sprintf(`{"time_series_id":%q,"monitoring_location_id":"USGS-a","parameter_code":"00060","time":%q,"value":%s,"unit_of_measure":"ft^3/s","approval_status":"Provisional","qualifier":["ICE"]}`, series, tm, val)
+		}
+		if r.URL.Query().Get("cursor") == "2" {
+			fmt.Fprint(w, fc("", hv("s1", "2026-11-03T15:00:00+00:00", `"44.5"`)))
+			return
+		}
+		fmt.Fprint(w, fc(srv.URL+"/collections/continuous/items?cursor=2",
+			hv("s1", "2026-11-03T15:30:00+00:00", `"46.0"`),
+			hv("s1", "2026-11-03T15:15:00+00:00", `"-999999"`),
+			hv("s2", "2026-11-03T15:15:00+00:00", `"7"`),
+			hv("s1", "2026-11-03T15:45:00+00:00", `null`),
+			hv("s1", "2026-11-03T16:00:00+00:00", `"NaN"`),
+		))
+	}))
+	defer srv.Close()
+
+	c := NewClient(&Options{BaseURL: srv.URL, APIKey: "k"})
+	start := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Hour)
+	got, err := c.History(ctx, "USGS-a", "00060", start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d values, want 3: %+v", len(got), got)
+	}
+	if got[0].Value != 44.5 || !got[0].Time.Equal(start) {
+		t.Errorf("first = %+v, want 44.5 at %s (sorted, from page 2)", got[0], start)
+	}
+	if got[1].SeriesID != "s2" || got[1].Value != 7 || got[2].Value != 46 {
+		t.Errorf("rest = %+v", got[1:])
+	}
+	if got[2].Unit != "ft^3/s" || got[2].Approval != "Provisional" || len(got[2].Qualifiers) != 1 {
+		t.Errorf("fields = %+v", got[2])
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("got %d requests, want 2", len(reqs))
+	}
+	q := reqs[0].URL.Query()
+	if q.Get("monitoring_location_id") != "USGS-a" || q.Get("parameter_code") != "00060" ||
+		q.Get("time") != "2026-11-03T15:00:00Z/2026-11-03T17:00:00Z" {
+		t.Errorf("query = %v", q)
+	}
+	for _, r := range reqs {
+		if r.Header.Get("X-Api-Key") != "k" {
+			t.Errorf("api key header = %q", r.Header.Get("X-Api-Key"))
+		}
+	}
+}
+
+func TestHistoryEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, fc("")) }))
+	defer srv.Close()
+	got, err := NewClient(&Options{BaseURL: srv.URL}).History(ctx, "a", "00060", time.Unix(0, 0), time.Unix(60, 0))
+	if err != nil || got == nil || len(got) != 0 {
+		t.Errorf("got %v, %v; want empty, nil", got, err)
+	}
+}
+
+func TestHistoryBadArgs(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
+	defer srv.Close()
+	c := NewClient(&Options{BaseURL: srv.URL})
+	t0 := time.Unix(1000, 0)
+	for name, f := range map[string]func() error{
+		"empty site":  func() error { _, err := c.History(ctx, "", "00060", t0, t0.Add(time.Hour)); return err },
+		"bare prefix": func() error { _, err := c.History(ctx, "USGS-", "00060", t0, t0.Add(time.Hour)); return err },
+		"empty code":  func() error { _, err := c.History(ctx, "a", "", t0, t0.Add(time.Hour)); return err },
+		"equal times": func() error { _, err := c.History(ctx, "a", "00060", t0, t0); return err },
+		"sub-second": func() error {
+			_, err := c.History(ctx, "a", "00060", t0, t0.Add(500*time.Millisecond))
+			return err
+		},
+		"reversed": func() error { _, err := c.History(ctx, "a", "00060", t0, t0.Add(-time.Hour)); return err },
+	} {
+		var re *Error
+		if err := f(); !errors.As(err, &re) || re.Op != "continuous" {
+			t.Errorf("%s: got %v, want *Error", name, err)
+		}
+	}
+	if called {
+		t.Error("bad arguments made a request")
+	}
+}
+
+func TestHistoryErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	_, err := NewClient(&Options{BaseURL: srv.URL}).History(ctx, "a", "00060", time.Unix(0, 0), time.Unix(60, 0))
+	var re *Error
+	if !errors.As(err, &re) || re.Status != http.StatusTooManyRequests || re.Op != "continuous" {
+		t.Errorf("got %v, want *Error 429", err)
+	}
+}
+
+// Live check against the real Water Data API; run with TRIBUTARY_LIVE=1.
+func TestHistoryLive(t *testing.T) {
+	if os.Getenv("TRIBUTARY_LIVE") == "" {
+		t.Skip("set TRIBUTARY_LIVE=1 to hit the real Water Data API")
+	}
+	// Amicalola Creek near Dawsonville, GA: discharge.
+	end := time.Now()
+	got, err := NewClient(nil).History(context.Background(), "02390000", "00060", end.Add(-6*time.Hour), end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("no values")
+	}
+	t.Logf("%d values, first %v, last %v", len(got), got[0], got[len(got)-1])
+}
+
+var ctx = context.Background()
