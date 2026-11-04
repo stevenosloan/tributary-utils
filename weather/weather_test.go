@@ -1261,3 +1261,53 @@ func TestCacheKeyIncludesHost(t *testing.T) {
 		}
 	}
 }
+
+func TestSummarizeSkipsUnparsedReport(t *testing.T) {
+	st := station{ID: "X"}
+	full := func(ago time.Duration, temp, hpa float64) report {
+		return report{testNow.Add(-ago), obsProps{
+			Description: "Clear",
+			Temperature: &measure{ptr(temp), "wmoUnit:degC"},
+			Barometric:  &measure{ptr(hpa * 100), "wmoUnit:Pa"},
+		}}
+	}
+	blank := func(ago time.Duration) report {
+		return report{testNow.Add(-ago), obsProps{
+			Description: "Fog/Mist", RawMessage: "KX 011955Z",
+			Temperature: &measure{nil, "wmoUnit:degC"},
+		}}
+	}
+
+	t.Run("older complete report", func(t *testing.T) {
+		rs := []report{blank(5 * time.Minute), full(25*time.Minute, 20, 1013), full(3*time.Hour+25*time.Minute, 20, 1010)}
+		o := summarize(st, 1, rs, testNow)
+		if o == nil || o.TemperatureC == nil || *o.TemperatureC != 20 || o.Description != "Clear" || !o.Time.Equal(rs[1].T) {
+			t.Fatalf("got %+v", o)
+		}
+		// Trend is anchored on the chosen report, not the blank one.
+		if o.PressureTrend != "rising" || o.PressureChangeHPa == nil || *o.PressureChangeHPa != 3 {
+			t.Errorf("trend = %q %v", o.PressureTrend, o.PressureChangeHPa)
+		}
+	})
+	t.Run("all blank", func(t *testing.T) {
+		rs := []report{blank(5 * time.Minute), blank(25 * time.Minute)}
+		o := summarize(st, 1, rs, testNow)
+		if o == nil || o.TemperatureC != nil || o.Description != "Fog/Mist" || !o.Time.Equal(rs[0].T) {
+			t.Fatalf("got %+v", o)
+		}
+	})
+	t.Run("complete older than maxAge ignored", func(t *testing.T) {
+		rs := []report{blank(5 * time.Minute), full(maxAge+time.Minute, 20, 1013)}
+		o := summarize(st, 1, rs, testNow)
+		if o == nil || o.TemperatureC != nil || !o.Time.Equal(rs[0].T) {
+			t.Fatalf("got %+v", o)
+		}
+	})
+	t.Run("complete newest", func(t *testing.T) {
+		rs := []report{full(5*time.Minute, 18, 1013), full(25*time.Minute, 20, 1013)}
+		o := summarize(st, 1, rs, testNow)
+		if o == nil || *o.TemperatureC != 18 || !o.Time.Equal(rs[0].T) {
+			t.Fatalf("got %+v", o)
+		}
+	})
+}

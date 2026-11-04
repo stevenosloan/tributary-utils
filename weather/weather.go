@@ -699,14 +699,30 @@ func (c *Client) fetchObservations(ctx context.Context, id string) ([]report, er
 
 // summarize builds the Observation for a station from its reports, newest
 // first. It returns nil if there are none or the newest is older than maxAge.
+//
+// NWS often publishes a report before its values are parsed, so the newest can
+// have null temperature, wind and pressure. The values, time and description
+// all come from the newest report within maxAge that has at least one of those
+// (see hasCore), so they stay consistent; if none does, the newest is used.
 func summarize(st station, km float64, rs []report, now time.Time) *Observation {
 	if len(rs) == 0 || now.Sub(rs[0].T) > maxAge {
 		return nil
 	}
-	p := rs[0].P
+	ci := 0
+	for i, r := range rs {
+		if now.Sub(r.T) > maxAge {
+			break
+		}
+		if r.P.hasCore() {
+			ci = i
+			break
+		}
+	}
+	chosen := rs[ci:]
+	p := chosen[0].P
 	o := &Observation{
 		StationID: st.ID, StationName: st.Name, Lat: st.Lat, Lon: st.Lon,
-		DistanceKm: km, ElevationM: st.ElevM, Time: rs[0].T, Description: p.Description,
+		DistanceKm: km, ElevationM: st.ElevM, Time: chosen[0].T, Description: p.Description,
 		TemperatureC:     p.Temperature.convert(unitTemp),
 		DewpointC:        p.Dewpoint.convert(unitTemp),
 		HumidityPct:      p.Humidity.convert(unitPercent),
@@ -721,14 +737,21 @@ func summarize(st station, km float64, rs []report, now time.Time) *Observation 
 		pick = func(p obsProps) *float64 { return p.SeaLevel.convert(unitPressure) }
 	}
 	o.PressureHPa = pick(p)
-	o.PressureTrend, o.PressureChangeHPa = pressureTrend(rs, pick)
+	o.PressureTrend, o.PressureChangeHPa = pressureTrend(chosen, pick)
 	pr := precipTotals(rs, now)
 	o.PrecipLast1hMm, o.PrecipLast6hMm, o.PrecipLast24hMm = pr.h1, pr.h6, pr.h24
 	o.PrecipLast6hMissingHours, o.PrecipLast24hMissingHours = pr.miss6, pr.miss24
 	return o
 }
 
-// pressureTrend compares the newest report's pressure with that of the report
+// hasCore reports whether the report has a temperature, wind speed or
+// pressure, the values a just-published, still unparsed report lacks.
+func (p obsProps) hasCore() bool {
+	return p.Temperature.convert(unitTemp) != nil || p.WindSpeed.convert(unitSpeed) != nil ||
+		p.Barometric.convert(unitPressure) != nil || p.SeaLevel.convert(unitPressure) != nil
+}
+
+// pressureTrend compares the first report's pressure with that of the report
 // closest to 3 hours earlier, within 30 minutes either way.
 func pressureTrend(rs []report, pick func(obsProps) *float64) (string, *float64) {
 	now := pick(rs[0].P)

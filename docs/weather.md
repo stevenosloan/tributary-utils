@@ -104,6 +104,17 @@ than the point or each other (see `DistanceKm` and `ElevationM`), so
 temperature and pressure differ by more than measurement error. Prefer one
 station's values together when you can.
 
+### Which report is used
+
+NWS often publishes a report before its values are parsed, so a station's
+newest report can have null temperature, wind and pressure even though its raw
+METAR has them. The station is still kept (its newest report is under two hours
+old), but its values come from the newest report within two hours that has at
+least one of temperature, wind speed or pressure. All values, `Time` and
+`Description` come from that one report so they stay consistent. If no report
+in that window has any of them, the newest report is used. The pressure trend
+is measured from the report used. Precipitation is unaffected.
+
 ### Fields
 
 Anything a station doesn't report is `nil`, never 0. A reported 0 (0 mm of
@@ -113,7 +124,7 @@ rain, 0 degC) is 0.
 |-------|---------|
 | `StationID`, `StationName`, `Lat`, `Lon`, `ElevationM` | The station |
 | `DistanceKm` | Straight-line distance from the requested point |
-| `Time`, `Description` | When the newest report was made, and NWS's text for it, e.g. `Mostly Cloudy` |
+| `Time`, `Description` | When the report used was made, and NWS's text for it, e.g. `Mostly Cloudy` |
 | `TemperatureC`, `DewpointC` | degC |
 | `HumidityPct` | Relative humidity, percent |
 | `WindSpeedKmh`, `WindGustKmh`, `WindDirectionDeg` | km/h, and degrees the wind blows from |
@@ -132,7 +143,7 @@ is treated as missing rather than guessed at.
 
 ### Precipitation totals
 
-Only the newest report supplies the other fields, but precipitation is
+Only one report supplies the other fields, but precipitation is
 assembled from the station's report history.
 
 A station files `precipitationLastHour` on its routine hourly report and on any
