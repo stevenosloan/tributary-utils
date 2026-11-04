@@ -110,13 +110,19 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+		if res.AllFailed() {
+			for s, err := range res.Errors {
+				fmt.Fprintf(os.Stderr, "error: %s: %v\n", s, err)
+			}
+			os.Exit(1)
+		}
 		return
 	}
 
 	r := res.Reach
 	where := "-"
-	if r.Lat != 0 || r.Lon != 0 {
-		where = fmt.Sprintf("%.4f, %.4f", r.Lat, r.Lon)
+	if r.Lat != nil && r.Lon != nil {
+		where = fmt.Sprintf("%.4f, %.4f", *r.Lat, *r.Lon)
 	}
 	fmt.Printf("comid %d  %s  (%s)\n", r.ID, r.Name, where)
 	for _, s := range seriesOrder(opts.Series) {
@@ -132,6 +138,9 @@ func main() {
 		for _, run := range runs {
 			printRun(run)
 		}
+	}
+	if res.AllFailed() {
+		os.Exit(1) // each series error was printed above
 	}
 }
 
