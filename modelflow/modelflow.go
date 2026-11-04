@@ -195,14 +195,14 @@ type Result struct {
 	// Errors holds every requested series that failed, including when all
 	// did; nil if none did.
 	Errors map[Series]error
-
-	requested int
 }
 
-// AllFailed reports whether every requested series failed, so Runs is empty
-// and Reach holds only the ID.
+// AllFailed reports whether every requested series failed: there is at least
+// one error and no series succeeded (Runs has an entry, possibly empty, for
+// every series that did). Reach then holds only the ID. It reads only the
+// exported fields, so a Result built by hand in a test behaves the same.
 func (r *Result) AllFailed() bool {
-	return len(r.Errors) > 0 && len(r.Errors) == r.requested
+	return len(r.Errors) > 0 && len(r.Runs) == 0
 }
 
 // Run returns the first run of s, or nil if s failed, wasn't requested or
@@ -264,7 +264,7 @@ func (c *Client) Flow(ctx context.Context, comid int) (*Result, error) {
 		return nil, &Error{Op: "flow", Err: err}
 	}
 
-	res := &Result{Reach: Reach{ID: comid}, Runs: map[Series][]Run{}, requested: n}
+	res := &Result{Reach: Reach{ID: comid}, Runs: map[Series][]Run{}}
 	got := false
 	for i, s := range c.series {
 		if errs[i] != nil {

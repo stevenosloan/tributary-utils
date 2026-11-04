@@ -751,3 +751,24 @@ func TestLive(t *testing.T) {
 		}
 	}
 }
+
+// A Result built by hand, as in a caller's test fake, reports AllFailed from
+// its exported fields alone.
+func TestAllFailedHandBuilt(t *testing.T) {
+	boom := errors.New("boom")
+	cases := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{"all failed", Result{Errors: map[Series]error{Analysis: boom, ShortRange: boom}}, true},
+		{"one ok", Result{Runs: map[Series][]Run{Analysis: {}}, Errors: map[Series]error{ShortRange: boom}}, false},
+		{"none failed", Result{Runs: map[Series][]Run{Analysis: {}}}, false},
+		{"empty", Result{}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.res.AllFailed(); got != tc.want {
+			t.Errorf("%s: AllFailed() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
