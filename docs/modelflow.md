@@ -10,7 +10,18 @@ gauge or no gauge.
 c := modelflow.NewClient(nil)
 res, err := c.Flow(ctx, 6495864)
 if err != nil {
-	return err // every series failed
+	return err // bad COMID, or ctx done: no call was made or finished
+}
+if res.AllFailed() {
+	// Nothing usable. res.Reach has only the ID.
+	for s, err := range res.Errors {
+		if errors.Is(err, modelflow.ErrUnavailable) {
+			log.Printf("%s: unknown reach or NWPS outage", s)
+		} else {
+			log.Printf("%s: %v", s, err)
+		}
+	}
+	return errors.New("no model flow")
 }
 for s, err := range res.Errors {
 	log.Printf("%s: %v", s, err) // some series failed, the rest are usable
@@ -58,9 +69,9 @@ given, and NWPS's refusal is reported for that series in `Result.Errors`.
 
 | Field | Meaning |
 |-------|---------|
-| `Result.Reach` | `ID` (COMID), `Name`, `Lat`, `Lon`, from the first requested series that came back |
+| `Result.Reach` | `ID` (COMID), `Name`, `Lat`, `Lon`, from the first requested series that came back. `Lat` and `Lon` are `*float64`, nil when NWPS gives no location. If every series failed, only `ID` is set (from the requested COMID) |
 | `Result.Runs` | Runs per requested series. A series that came back empty has an empty slice, not a missing key. A series that wasn't requested or failed is absent |
-| `Result.Errors` | Series that failed, with their error; `nil` if none did |
+| `Result.Errors` | Every requested series that failed, with its error, including when all did; `nil` if none did |
 | `Run.Series`, `Run.Member` | The series, and the ensemble member. Analysis and short range have one, named `series`. Medium and long range may have several (`mean`, `member1`, ...); members are sorted by name |
 | `Run.ReferenceTime` | When the model run started |
 | `Run.Unit` | `ft^3/s` for what NWPS serves. `ft³/s`, `ft3/s`, `ft^3/s` and `cfs` are all written `ft^3/s`, as in `readings`; any other unit is left as given |
@@ -69,13 +80,20 @@ given, and NWPS's refusal is reported for that series in `Result.Errors`.
 `Result.Run(series)` returns the first run of a series, or nil if it failed,
 wasn't requested or came back empty.
 
-One series failing doesn't fail the others. `Flow` returns an error only when
-every requested series failed: the first one in request order. A `comid <= 0`
-is an error without a request.
+`Result.AllFailed()` is true when every requested series failed (`Errors` has
+an entry for each and `Runs` is empty).
+
+One series failing doesn't fail the others, and series failures are never
+`Flow`'s own error, even when all of them fail: `Flow` returns `(res, nil)`
+and `res.Errors` holds each one. `Flow` returns `(nil, err)` only when it
+couldn't make the call: a `comid <= 0`, or a context already done before the
+call or ended while the series were fetched. Both are an `*Error` with `Op`
+`flow`; the context case wraps `ctx.Err()`, so `errors.Is(err,
+context.Canceled)` and `context.DeadlineExceeded` work.
 
 ## Errors
 
-`*Error` reports a failed request: `Op` is the series (`flow` for a bad COMID),
+`*Error` reports a failed request: `Op` is the series (`flow` for a bad COMID or a done context),
 `Status` is the HTTP status (0 when no response arrived), and `Timeout()`
 reports whether it timed out, on our side or as a 504. The default client
 allows 30s per request.
@@ -104,14 +122,14 @@ turns caching off, and a shared or remote store can be supplied.
 
 | | |
 |-|-|
-| Key | `modelflow:v1:<host>:<comid>:<series>`, the host of the base URL lowercased, so clients on different endpoints can share a store |
+| Key | `modelflow:v2:<host>:<comid>:<series>`, the host of the base URL lowercased, so clients on different endpoints can share a store |
 | Value | JSON of the reach and the series' runs |
 | TTL | `Options.CacheTTL`, default 15 minutes |
 
 An empty series is cached too, so an empty medium range isn't requested again
 on every call. Failures are never cached. A store that errors, or holds a value
 that doesn't decode, is treated as a miss, and a failed write is ignored:
-`Flow` never fails because of the cache. Change the `v1` in the key if the
+`Flow` never fails because of the cache. Change the `v2` in the key if the
 stored shape changes.
 
 ## Accuracy

@@ -155,9 +155,10 @@ func NewClient(opts *Options) *Client {
 
 // Reach identifies a river reach.
 type Reach struct {
-	ID       int // NHDPlusV2 COMID
-	Name     string
-	Lat, Lon float64
+	ID   int // NHDPlusV2 COMID
+	Name string
+	// Lat and Lon locate the reach; nil when NWPS gives no location.
+	Lat, Lon *float64
 }
 
 // Point is one flow value.
@@ -180,13 +181,24 @@ type Run struct {
 
 // Result is the flow for one reach.
 type Result struct {
-	// Reach is from the first requested series that came back.
+	// Reach is from the first requested series that came back. If every
+	// series failed it is zero-valued apart from ID, which is set from the
+	// requested COMID.
 	Reach Reach
 	// Runs holds the runs of each requested series that succeeded, members
 	// sorted by name. A series that came back empty has an empty slice.
 	Runs map[Series][]Run
-	// Errors holds the requested series that failed; nil if none did.
+	// Errors holds every requested series that failed, including when all
+	// did; nil if none did.
 	Errors map[Series]error
+
+	requested int
+}
+
+// AllFailed reports whether every requested series failed, so Runs is empty
+// and Reach holds only the ID.
+func (r *Result) AllFailed() bool {
+	return len(r.Errors) > 0 && len(r.Errors) == r.requested
 }
 
 // Run returns the first run of s, or nil if s failed, wasn't requested or
@@ -199,17 +211,28 @@ func (r *Result) Run(s Series) *Run {
 }
 
 // Flow returns the streamflow of the reach with the given COMID, fetching each
-// configured series in parallel. A series that fails doesn't fail the others;
-// it is recorded in Result.Errors. Flow itself returns an error only if every
-// series failed, the first in request order. If every series was unavailable
-// that error wraps ErrUnavailable. A comid <= 0 is an *Error without a
-// request.
+// configured series in parallel.
+//
+// Series failures are never Flow's error. A series that fails doesn't fail the
+// others; it is recorded in Result.Errors, and Result.Runs holds those that
+// succeeded. When every series failed Flow still returns a Result with a nil
+// error: check Result.AllFailed. Reach is then zero-valued apart from ID. If
+// a series was unavailable its error wraps ErrUnavailable.
+//
+// Flow returns a nil Result and a non-nil error only when it couldn't make
+// the call: a comid <= 0, or a context that was done before or while the
+// series were fetched (a canceled or expired context). Both are an *Error
+// with Op "flow"; the context case wraps the context's error, so
+// errors.Is(err, context.Canceled) and context.DeadlineExceeded work.
 //
 // Series found in the cache are not requested again. A request that fails with
 // 502, 503 or 504, or times out, is retried once after a short pause.
 func (c *Client) Flow(ctx context.Context, comid int) (*Result, error) {
 	if comid <= 0 {
 		return nil, &Error{Op: "flow", Err: fmt.Errorf("invalid COMID %d", comid)}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, &Error{Op: "flow", Err: err}
 	}
 	n := len(c.series)
 	entries := make([]*entry, n)
@@ -233,27 +256,25 @@ func (c *Client) Flow(ctx context.Context, comid int) (*Result, error) {
 	}
 	_ = httpx.Parallel(ctx, maxConcurrent, fns...)
 
-	res := &Result{Runs: map[Series][]Run{}}
-	var first error
+	if err := ctx.Err(); err != nil {
+		return nil, &Error{Op: "flow", Err: err}
+	}
+
+	res := &Result{Reach: Reach{ID: comid}, Runs: map[Series][]Run{}, requested: n}
+	got := false
 	for i, s := range c.series {
 		if errs[i] != nil {
 			if res.Errors == nil {
 				res.Errors = map[Series]error{}
 			}
 			res.Errors[s] = errs[i]
-			if first == nil {
-				first = errs[i]
-			}
 			continue
 		}
 		e := entries[i]
-		if res.Reach.ID == 0 {
-			res.Reach = e.Reach
+		if !got {
+			res.Reach, got = e.Reach, true
 		}
 		res.Runs[s] = e.Runs
-	}
-	if len(res.Errors) == n {
-		return nil, first
 	}
 	return res, nil
 }
@@ -271,7 +292,7 @@ func (c *Client) cacheKey(comid int, s Series) string {
 	if u, err := url.Parse(c.base); err == nil && u.Host != "" {
 		host = u.Host
 	}
-	return "modelflow:v1:" + strings.ToLower(host) + ":" + strconv.Itoa(comid) + ":" + string(s)
+	return "modelflow:v2:" + strings.ToLower(host) + ":" + strconv.Itoa(comid) + ":" + string(s)
 }
 
 // cached returns the cached entry, or nil on a miss. A store error or an
@@ -394,7 +415,7 @@ func decode(body []byte, comid int, s Series) (*entry, error) {
 		e.Reach.ID = id
 	}
 	if top.Reach.Lat != nil && top.Reach.Lon != nil {
-		e.Reach.Lat, e.Reach.Lon = *top.Reach.Lat, *top.Reach.Lon
+		e.Reach.Lat, e.Reach.Lon = top.Reach.Lat, top.Reach.Lon
 	}
 
 	f := s.field()

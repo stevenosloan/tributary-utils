@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -102,6 +103,19 @@ func unavailableBody(w http.ResponseWriter) {
 	fmt.Fprint(w, `{"code": 14, "message": "Data unavailable", "details": []}`)
 }
 
+// seriesErr returns the error for series s of a Flow call that must have
+// succeeded as a call, failing the test otherwise.
+func seriesErr(t *testing.T, res *Result, err error, s Series) error {
+	t.Helper()
+	if err != nil || res == nil {
+		t.Fatalf("Flow error = %v, res = %v; want series errors only", err, res)
+	}
+	if res.Errors[s] == nil {
+		t.Fatalf("no error for %s; Errors = %v", s, res.Errors)
+	}
+	return res.Errors[s]
+}
+
 func client(f *fake, o Options) *Client {
 	o.BaseURL = f.srv.URL
 	return NewClient(&o)
@@ -116,8 +130,11 @@ func TestFlow(t *testing.T) {
 	if res.Errors != nil {
 		t.Errorf("Errors = %v", res.Errors)
 	}
-	if want := (Reach{ID: 6495864, Name: "Amicalola Creek", Lat: 34.4119, Lon: -84.213}); res.Reach != want {
-		t.Errorf("Reach = %+v", res.Reach)
+	if r := res.Reach; r.ID != 6495864 || r.Name != "Amicalola Creek" || r.Lat == nil || r.Lon == nil || *r.Lat != 34.4119 || *r.Lon != -84.213 {
+		t.Errorf("Reach = %+v", r)
+	}
+	if res.AllFailed() {
+		t.Error("AllFailed on success")
 	}
 	a := res.Run(Analysis)
 	if a == nil || a.Member != "series" || a.Unit != "ft^3/s" || a.Series != Analysis {
@@ -212,18 +229,90 @@ func TestAllFail(t *testing.T) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
 	res, err := client(f, Options{}).Flow(ctx, 6495864)
-	var e *Error
-	if err == nil || res != nil || !errors.As(err, &e) || e.Status != 500 {
+	if err != nil || res == nil {
 		t.Fatalf("res=%v err=%v", res, err)
 	}
-	if !strings.HasPrefix(err.Error(), "modelflow: analysis_assimilation: ") {
-		t.Errorf("error = %q", err)
+	if !res.AllFailed() {
+		t.Error("AllFailed = false")
+	}
+	if len(res.Errors) != 2 || len(res.Runs) != 0 {
+		t.Fatalf("Errors = %v, Runs = %v", res.Errors, res.Runs)
+	}
+	for _, s := range DefaultSeries() {
+		var e *Error
+		if err := res.Errors[s]; !errors.As(err, &e) || e.Status != 500 || e.Op != string(s) {
+			t.Errorf("%s: err = %v", s, err)
+		}
+	}
+	if res.Reach.ID != 6495864 || res.Reach.Name != "" || res.Reach.Lat != nil || res.Reach.Lon != nil {
+		t.Errorf("Reach = %+v", res.Reach)
+	}
+	if res.Run(Analysis) != nil {
+		t.Error("Run on failed series")
+	}
+}
+
+func TestPartialNotAllFailed(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, s string, n int) {
+		if s == "short_range" {
+			http.Error(w, "boom", 500)
+			return
+		}
+		standard(w, s, n)
+	})
+	res, err := client(f, Options{}).Flow(ctx, 6495864)
+	if err != nil || res.AllFailed() || len(res.Errors) != 1 || res.Run(Analysis) == nil {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if res.Reach.Name != "Amicalola Creek" {
+		t.Errorf("Reach = %+v", res.Reach)
+	}
+}
+
+func TestContextAlreadyDone(t *testing.T) {
+	f := newFake(t, standard)
+	c, cancel := context.WithCancel(ctx)
+	cancel()
+	res, err := client(f, Options{}).Flow(c, 6495864)
+	var e *Error
+	if res != nil || !errors.As(err, &e) || e.Op != "flow" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("res=%v err=%v", res, err)
+	}
+	if f.total() != 0 {
+		t.Error("request made with done context")
+	}
+}
+
+func TestContextEndsWhileFetching(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, s string, n int) { time.Sleep(300 * time.Millisecond) })
+	c, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	res, err := client(f, Options{}).Flow(c, 6495864)
+	var e *Error
+	if res != nil || !errors.As(err, &e) || e.Op != "flow" || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("res=%v err=%v", res, err)
+	}
+}
+
+func TestLatLon(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, s string, n int) {
+		fmt.Fprint(w, `{"reach":{"reachId":"6495864","name":"No Place"},"shortRange":{}}`)
+	})
+	res, err := client(f, Options{Series: []Series{ShortRange}}).Flow(ctx, 6495864)
+	if err != nil || res.Reach.Lat != nil || res.Reach.Lon != nil || res.Reach.Name != "No Place" {
+		t.Fatalf("absent: res=%+v err=%v", res, err)
+	}
+	f = newFake(t, standard)
+	res, err = client(f, Options{Series: []Series{ShortRange}}).Flow(ctx, 6495864)
+	if err != nil || res.Reach.Lat == nil || res.Reach.Lon == nil || *res.Reach.Lat != 34.4119 || *res.Reach.Lon != -84.213 {
+		t.Fatalf("present: res=%+v err=%v", res, err)
 	}
 }
 
 func TestUnavailable(t *testing.T) {
 	f := newFake(t, func(w http.ResponseWriter, s string, n int) { unavailableBody(w) })
-	_, err := client(f, Options{}).Flow(ctx, 6495864)
+	res, err := client(f, Options{}).Flow(ctx, 6495864)
+	err = seriesErr(t, res, err, ShortRange)
 	var e *Error
 	if !errors.Is(err, ErrUnavailable) || !errors.As(err, &e) || e.Status != 503 {
 		t.Fatalf("err = %v", err)
@@ -234,8 +323,9 @@ func TestUnavailable(t *testing.T) {
 
 	// A plain 503 isn't "Data unavailable".
 	f = newFake(t, func(w http.ResponseWriter, s string, n int) { http.Error(w, "down", 503) })
-	_, err = client(f, Options{}).Flow(ctx, 6495864)
-	if err == nil || errors.Is(err, ErrUnavailable) {
+	res, err = client(f, Options{}).Flow(ctx, 6495864)
+	err = seriesErr(t, res, err, ShortRange)
+	if errors.Is(err, ErrUnavailable) {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -261,7 +351,8 @@ func TestRetry(t *testing.T) {
 
 func TestRetryOnce(t *testing.T) {
 	f := newFake(t, func(w http.ResponseWriter, s string, n int) { w.WriteHeader(504) })
-	_, err := client(f, Options{Series: []Series{Analysis}}).Flow(ctx, 6495864)
+	res, err := client(f, Options{Series: []Series{Analysis}}).Flow(ctx, 6495864)
+	err = seriesErr(t, res, err, Analysis)
 	var e *Error
 	if !errors.As(err, &e) || !e.Timeout() {
 		t.Errorf("err = %v", err)
@@ -274,10 +365,8 @@ func TestRetryOnce(t *testing.T) {
 func TestNoRetry(t *testing.T) {
 	for _, status := range []int{404, 400} {
 		f := newFake(t, func(w http.ResponseWriter, s string, n int) { w.WriteHeader(status) })
-		_, err := client(f, Options{Series: []Series{Analysis}}).Flow(ctx, 6495864)
-		if err == nil {
-			t.Fatalf("%d: no error", status)
-		}
+		res, err := client(f, Options{Series: []Series{Analysis}}).Flow(ctx, 6495864)
+		seriesErr(t, res, err, Analysis)
 		if f.total() != 1 {
 			t.Errorf("%d: requests = %d", status, f.total())
 		}
@@ -292,7 +381,7 @@ func TestRetryRespectsContext(t *testing.T) {
 	c, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := client(f, Options{Series: []Series{Analysis}}).Flow(c, 6495864); err == nil {
+	if res, err := client(f, Options{Series: []Series{Analysis}}).Flow(c, 6495864); err == nil || res != nil {
 		t.Fatal("no error")
 	}
 	if time.Since(start) > 5*time.Second {
@@ -303,7 +392,8 @@ func TestRetryRespectsContext(t *testing.T) {
 func TestTimeout(t *testing.T) {
 	f := newFake(t, func(w http.ResponseWriter, s string, n int) { time.Sleep(200 * time.Millisecond) })
 	c := client(f, Options{Series: []Series{Analysis}, HTTPClient: &http.Client{Timeout: 20 * time.Millisecond}})
-	_, err := c.Flow(ctx, 6495864)
+	res, err := c.Flow(ctx, 6495864)
+	err = seriesErr(t, res, err, Analysis)
 	var e *Error
 	if !errors.As(err, &e) || !e.Timeout() || e.Status != 0 {
 		t.Fatalf("err = %v", err)
@@ -312,8 +402,9 @@ func TestTimeout(t *testing.T) {
 
 func TestBadBody(t *testing.T) {
 	f := newFake(t, func(w http.ResponseWriter, s string, n int) { fmt.Fprint(w, "not json") })
-	_, err := client(f, Options{Series: []Series{Analysis}}).Flow(ctx, 6495864)
-	if err == nil || !strings.Contains(err.Error(), "decoding response") {
+	res, err := client(f, Options{Series: []Series{Analysis}}).Flow(ctx, 6495864)
+	err = seriesErr(t, res, err, Analysis)
+	if !strings.Contains(err.Error(), "decoding response") {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -439,7 +530,7 @@ func TestCacheHit(t *testing.T) {
 	if f.total() != 3 {
 		t.Errorf("requests after cached call = %d, want 3", f.total())
 	}
-	if fmt.Sprint(first) != fmt.Sprint(second) {
+	if !reflect.DeepEqual(first, second) {
 		t.Errorf("cached result differs:\n%v\n%v", first, second)
 	}
 	if r := second.Run(Analysis); r == nil || r.Unit != "ft^3/s" || len(r.Points) != 2 {
@@ -452,7 +543,7 @@ func TestCacheHit(t *testing.T) {
 	if second.Reach.Name != "Amicalola Creek" {
 		t.Errorf("Reach = %+v", second.Reach)
 	}
-	want := "modelflow:v1:" + strings.TrimPrefix(f.srv.URL, "http://") + ":6495864:analysis_assimilation"
+	want := "modelflow:v2:" + strings.TrimPrefix(f.srv.URL, "http://") + ":6495864:analysis_assimilation"
 	if _, ok := st.items[want]; !ok {
 		t.Errorf("key %q not set; keys %v", want, st.lastKeys)
 	}
@@ -534,7 +625,7 @@ func TestCacheDoesNotStoreFailures(t *testing.T) {
 	if res.Errors[ShortRange] == nil {
 		t.Fatal("expected short range failure")
 	}
-	if _, ok := st.items["modelflow:v1:"+strings.TrimPrefix(f.srv.URL, "http://")+":6495864:short_range"]; ok {
+	if _, ok := st.items["modelflow:v2:"+strings.TrimPrefix(f.srv.URL, "http://")+":6495864:short_range"]; ok {
 		t.Error("failure cached")
 	}
 	res, err := c.Flow(ctx, 6495864)
@@ -556,7 +647,7 @@ func TestFailingStore(t *testing.T) {
 func TestCorruptCacheEntry(t *testing.T) {
 	f := newFake(t, standard)
 	st := newFakeStore()
-	st.Set(ctx, "modelflow:v1:"+strings.TrimPrefix(f.srv.URL, "http://")+":6495864:analysis_assimilation", []byte("garbage"), time.Hour)
+	st.Set(ctx, "modelflow:v2:"+strings.TrimPrefix(f.srv.URL, "http://")+":6495864:analysis_assimilation", []byte("garbage"), time.Hour)
 	res, err := client(f, Options{Cache: st, Series: []Series{Analysis}}).Flow(ctx, 6495864)
 	if err != nil || res.Run(Analysis) == nil || f.total() != 1 {
 		t.Errorf("res=%+v err=%v requests=%d", res, err, f.total())
@@ -609,10 +700,17 @@ func TestZonelessTimes(t *testing.T) {
 	}
 }
 
+func TestCacheKeyVersion(t *testing.T) {
+	c := NewClient(&Options{BaseURL: "https://api.example.test/v1"})
+	if got := c.cacheKey(5, Analysis); !strings.HasPrefix(got, "modelflow:v2:") {
+		t.Errorf("key = %q", got)
+	}
+}
+
 func TestCacheKeyHost(t *testing.T) {
 	a := NewClient(&Options{BaseURL: "https://API.example.test/v1"})
 	b := NewClient(&Options{BaseURL: "https://other.example.test/v1"})
-	if got := a.cacheKey(5, ShortRange); got != "modelflow:v1:api.example.test:5:short_range" {
+	if got := a.cacheKey(5, ShortRange); got != "modelflow:v2:api.example.test:5:short_range" {
 		t.Errorf("key = %q", got)
 	}
 	if a.cacheKey(5, ShortRange) == b.cacheKey(5, ShortRange) {
@@ -631,6 +729,9 @@ func TestLive(t *testing.T) {
 	}
 	if res.Errors != nil {
 		t.Errorf("Errors = %v", res.Errors)
+	}
+	if res.Reach.Lat == nil || res.Reach.Lon == nil {
+		t.Error("reach has no location")
 	}
 	t.Logf("reach %+v", res.Reach)
 	for _, s := range DefaultSeries() {
