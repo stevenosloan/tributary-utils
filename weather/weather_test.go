@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stevenosloan/tributary-utils/cache"
 )
 
 const testUA = "(example.com, contact@example.com)"
@@ -44,6 +47,15 @@ type fakeNWS struct {
 	periods  []map[string]any
 	hourly   []map[string]any
 	pointsAt func(w http.ResponseWriter, r *http.Request) bool // optional override
+	// cellAt names the grid cell a /points/ path belongs to; nil means "1,1".
+	cellAt func(path string) string
+}
+
+func (f *fakeNWS) cell(path string) string {
+	if f.cellAt != nil {
+		return f.cellAt(path)
+	}
+	return "1,1"
 }
 
 func newFake(t *testing.T) *fakeNWS {
@@ -76,13 +88,14 @@ func (f *fakeNWS) serve(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	switch {
 	case strings.HasPrefix(p, "/points/"):
+		g := f.srv.URL + "/gridpoints/TST/" + f.cell(p)
 		writeJSON(w, map[string]any{"properties": map[string]any{
-			"forecast":            f.srv.URL + "/gridpoints/TST/1,1/forecast",
-			"forecastHourly":      f.srv.URL + "/gridpoints/TST/1,1/forecast/hourly",
-			"observationStations": f.srv.URL + "/gridpoints/TST/1,1/stations",
+			"forecast":            g + "/forecast",
+			"forecastHourly":      g + "/forecast/hourly",
+			"observationStations": g + "/stations",
 			"timeZone":            "America/New_York",
 		}})
-	case p == "/gridpoints/TST/1,1/stations":
+	case strings.HasPrefix(p, "/gridpoints/TST/") && strings.HasSuffix(p, "/stations"):
 		var fs []any
 		for _, s := range f.stations {
 			fs = append(fs, map[string]any{
@@ -105,13 +118,13 @@ func (f *fakeNWS) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		http.NotFound(w, r)
-	case p == "/gridpoints/TST/1,1/forecast":
+	case strings.HasPrefix(p, "/gridpoints/TST/") && strings.HasSuffix(p, "/forecast"):
 		if r.URL.Query().Get("units") != "si" {
 			f.t.Errorf("forecast without units=si: %s", r.URL)
 		}
 		writeJSON(w, map[string]any{"properties": map[string]any{
 			"updateTime": "2026-11-04T18:26:49+00:00", "periods": f.periods}})
-	case p == "/gridpoints/TST/1,1/forecast/hourly":
+	case strings.HasPrefix(p, "/gridpoints/TST/") && strings.HasSuffix(p, "/forecast/hourly"):
 		writeJSON(w, map[string]any{"properties": map[string]any{
 			"updateTime": "2026-11-04T18:26:49+00:00", "periods": f.hourly}})
 	default:
@@ -491,7 +504,7 @@ func TestPrecipNullHours(t *testing.T) {
 	// (empty raw) in a third, nothing for the rest.
 	hr := func(h int, raw string, v *float64) report {
 		r := routine(raw, v)[0]
-		r.t = r.t.Add(-time.Duration(h) * time.Hour)
+		r.T = r.T.Add(-time.Duration(h) * time.Hour)
 		return r
 	}
 	rs := []report{hr(0, ao2, ptr(1.5)), hr(1, ao2, nil), hr(2, "", nil)}
@@ -524,30 +537,10 @@ func TestPrecipPrefersReportWithRawMessage(t *testing.T) {
 	}
 	// Among equals the latest wins.
 	later := metar
-	later.t = later.t.Add(2 * time.Minute)
-	later.p.Precip1h = &measure{ptr(4.0), "wmoUnit:mm"}
+	later.T = later.T.Add(2 * time.Minute)
+	later.P.Precip1h = &measure{ptr(4.0), "wmoUnit:mm"}
 	if pr := precipTotals([]report{later, metar}, testNow); pr.h1 == nil || *pr.h1 != 4 {
 		t.Errorf("1h = %v, want 4", pr.h1)
-	}
-}
-
-func TestPointCacheEvictsExpired(t *testing.T) {
-	f := newFake(t)
-	f.stations = stationsAt(1)
-	c := f.client(t)
-	now := testNow
-	c.now = func() time.Time { return now }
-	if _, err := c.Current(context.Background(), ptLat, ptLon); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(25 * time.Hour)
-	if _, err := c.Current(context.Background(), ptLat+0.5, ptLon); err != nil {
-		t.Fatal(err)
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.cache[pointKey(ptLat, ptLon)]; ok || len(c.cache) != 1 {
-		t.Errorf("cache has %d entries, want only the new one", len(c.cache))
 	}
 }
 
@@ -591,7 +584,7 @@ func TestPressureTrend(t *testing.T) {
 }
 
 func TestPressureFallsBackToSeaLevel(t *testing.T) {
-	st := station{id: "X"}
+	st := station{ID: "X"}
 	rs := []report{
 		{testNow.Add(-5 * time.Minute), obsProps{SeaLevel: &measure{ptr(101500), "wmoUnit:Pa"}}},
 		{testNow.Add(-3*time.Hour - 5*time.Minute), obsProps{SeaLevel: &measure{ptr(101200), "wmoUnit:Pa"}}},
@@ -599,43 +592,6 @@ func TestPressureFallsBackToSeaLevel(t *testing.T) {
 	o := summarize(st, 1, rs, testNow)
 	if o == nil || o.PressureHPa == nil || *o.PressureHPa != 1015 || o.PressureTrend != "rising" {
 		t.Errorf("got %+v", o)
-	}
-}
-
-func TestPointCache(t *testing.T) {
-	f := newFake(t)
-	f.stations = stationsAt(1)
-	c := f.client(t)
-	now := testNow
-	c.now = func() time.Time { return now }
-	ctx := context.Background()
-	for range 2 {
-		if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := c.Forecast(ctx, ptLat, ptLon); err != nil {
-		t.Fatal(err)
-	}
-	if n, s := f.count("/points/"), f.count("/gridpoints/TST/1,1/stations"); n != 1 || s != 1 {
-		t.Errorf("points/stations requests = %d/%d, want 1/1", n, s)
-	}
-	// The same point to 4 decimals shares an entry.
-	if _, err := c.Current(ctx, ptLat+0.00001, ptLon); err != nil {
-		t.Fatal(err)
-	}
-	if n := f.count("/points/"); n != 1 {
-		t.Errorf("points requests = %d, want 1", n)
-	}
-	now = now.Add(23 * time.Hour)
-	c.Current(ctx, ptLat, ptLon)
-	if n := f.count("/points/"); n != 1 {
-		t.Errorf("points requests after 23h = %d, want 1", n)
-	}
-	now = now.Add(2 * time.Hour)
-	c.Current(ctx, ptLat, ptLon)
-	if n, s := f.count("/points/"), f.count("/gridpoints/TST/1,1/stations"); n != 2 || s != 2 {
-		t.Errorf("points/stations requests after 25h = %d/%d, want 2/2", n, s)
 	}
 }
 
@@ -805,5 +761,503 @@ func TestLive(t *testing.T) {
 	}
 	if len(fc.Periods) < 10 || len(fc.Hourly) < 20 || fc.TimeZone == "" {
 		t.Errorf("forecast: %d periods, %d hourly, tz %q", len(fc.Periods), len(fc.Hourly), fc.TimeZone)
+	}
+}
+
+// fakeStore is a cache.Store with a settable clock and optional failures.
+type fakeStore struct {
+	mu      sync.Mutex
+	now     time.Time
+	items   map[string]fakeItem
+	failGet bool
+	failSet bool
+}
+
+type fakeItem struct {
+	val []byte
+	exp time.Time
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{now: testNow, items: map[string]fakeItem{}}
+}
+
+func (s *fakeStore) Get(_ context.Context, key string) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failGet {
+		return nil, false, errors.New("store down")
+	}
+	it, ok := s.items[key]
+	if !ok || !s.now.Before(it.exp) {
+		return nil, false, nil
+	}
+	return it.val, true, nil
+}
+
+func (s *fakeStore) Set(_ context.Context, key string, val []byte, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failSet {
+		return errors.New("store down")
+	}
+	s.items[key] = fakeItem{val: val, exp: s.now.Add(ttl)}
+	return nil
+}
+
+func (s *fakeStore) keys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ks []string
+	for k := range s.items {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// clock moves the client's time and the store's together.
+type clock struct {
+	c  *Client
+	st *fakeStore
+	t  time.Time
+}
+
+func (k *clock) advance(d time.Duration) {
+	k.t = k.t.Add(d)
+	k.st.mu.Lock()
+	k.st.now = k.t
+	k.st.mu.Unlock()
+}
+
+// cachedClient returns a client over a fakeStore, with a clock to move.
+func (f *fakeNWS) cachedClient(t *testing.T, opts Options) (*Client, *fakeStore, *clock) {
+	t.Helper()
+	st := newFakeStore()
+	opts.UserAgent, opts.BaseURL, opts.Cache = testUA, f.srv.URL, st
+	c, err := NewClient(&opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &clock{c: c, st: st, t: testNow}
+	c.now = func() time.Time { return k.t }
+	return c, st, k
+}
+
+func TestPointAndStationCache(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	c, _, k := f.cachedClient(t, Options{ObservationTTL: time.Nanosecond})
+	ctx := context.Background()
+	for range 2 {
+		if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Forecast(ctx, ptLat, ptLon); err != nil {
+		t.Fatal(err)
+	}
+	if n, s := f.count("/points/"), f.count("/gridpoints/TST/1,1/stations"); n != 1 || s != 1 {
+		t.Errorf("points/stations requests = %d/%d, want 1/1", n, s)
+	}
+	// The same point to 4 decimals shares an entry.
+	if _, err := c.Current(ctx, ptLat+0.00001, ptLon); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count("/points/"); n != 1 {
+		t.Errorf("points requests = %d, want 1", n)
+	}
+	k.advance(23 * time.Hour)
+	c.Current(ctx, ptLat, ptLon)
+	if n := f.count("/points/"); n != 1 {
+		t.Errorf("points requests after 23h = %d, want 1", n)
+	}
+	k.advance(2 * time.Hour)
+	c.Current(ctx, ptLat, ptLon)
+	if n, s := f.count("/points/"), f.count("/gridpoints/TST/1,1/stations"); n != 2 || s != 2 {
+		t.Errorf("points/stations requests after 25h = %d/%d, want 2/2", n, s)
+	}
+}
+
+func TestPointTTLOption(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	c, _, k := f.cachedClient(t, Options{PointTTL: time.Hour})
+	ctx := context.Background()
+	c.Current(ctx, ptLat, ptLon)
+	k.advance(2 * time.Hour)
+	c.Current(ctx, ptLat, ptLon)
+	if n := f.count("/points/"); n != 2 {
+		t.Errorf("points requests = %d, want 2", n)
+	}
+}
+
+func TestObservationCache(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1, 2)
+	c, _, k := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	for range 3 {
+		if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := f.count("/stations/"); n != 2 {
+		t.Errorf("observation requests = %d, want 2 (one per station)", n)
+	}
+	// A nearby point in the same cell shares the stations' observations.
+	if _, err := c.Current(ctx, ptLat+0.01, ptLon); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count("/stations/"); n != 2 {
+		t.Errorf("observation requests after nearby point = %d, want 2", n)
+	}
+	k.advance(4 * time.Minute)
+	c.Current(ctx, ptLat, ptLon)
+	if n := f.count("/stations/"); n != 2 {
+		t.Errorf("observation requests after 4m = %d, want 2", n)
+	}
+	k.advance(2 * time.Minute)
+	c.Current(ctx, ptLat, ptLon)
+	if n := f.count("/stations/"); n != 4 {
+		t.Errorf("observation requests after 6m = %d, want 4", n)
+	}
+}
+
+func TestCachedObservationStalenessAtReadTime(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	// The only report is 10 minutes old at testNow, and is cached for a day.
+	c, _, k := f.cachedClient(t, Options{ObservationTTL: 24 * time.Hour})
+	ctx := context.Background()
+	got, err := c.Current(ctx, ptLat, ptLon)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	k.advance(3 * time.Hour)
+	got, err = c.Current(ctx, ptLat, ptLon)
+	if err != nil || len(got) != 0 {
+		t.Errorf("after 3h got %v, %v; want the cached report skipped as stale", ids(got), err)
+	}
+	if n := f.count("/stations/"); n != 1 {
+		t.Errorf("observation requests = %d, want 1", n)
+	}
+}
+
+func TestCachedPrecipWindowMovesWithClock(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	f.stations[0].obs = hourlyPrecip(24, 1, -1)
+	c, _, k := f.cachedClient(t, Options{ObservationTTL: 24 * time.Hour})
+	ctx := context.Background()
+	first, err := c.Current(ctx, ptLat, ptLon)
+	if err != nil || len(first) != 1 || first[0].PrecipLast1hMm == nil {
+		t.Fatalf("got %v, %v", first, err)
+	}
+	k.advance(3 * time.Hour) // past maxAge for the newest routine report
+	got, err := c.Current(ctx, ptLat, ptLon)
+	if err != nil || len(got) != 0 {
+		t.Errorf("got %v, %v; want none", ids(got), err)
+	}
+}
+
+func TestForecastCache(t *testing.T) {
+	f := newFake(t)
+	start := func(h int) string { return testNow.Add(time.Duration(h) * time.Hour).Format(time.RFC3339) }
+	mk := func(h int) map[string]any {
+		return map[string]any{"startTime": start(h), "endTime": start(h + 1), "temperature": 10, "temperatureUnit": "C"}
+	}
+	f.periods = []map[string]any{mk(0)}
+	for h := -1; h < 30; h++ {
+		f.hourly = append(f.hourly, mk(h))
+	}
+	c, _, k := f.cachedClient(t, Options{ForecastTTL: 4 * time.Hour})
+	ctx := context.Background()
+	fc1, err := c.Forecast(ctx, ptLat, ptLon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc2, err := c.Forecast(ctx, ptLat, ptLon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count("/gridpoints/TST/1,1/forecast"); n != 2 {
+		t.Errorf("forecast requests = %d, want 2 (daily and hourly once each)", n)
+	}
+	if len(fc2.Periods) != 1 || len(fc2.Hourly) != 24 || fc2.TimeZone != "America/New_York" ||
+		!fc2.Updated.Equal(fc1.Updated) || !fc2.Hourly[0].Start.Equal(fc1.Hourly[0].Start) {
+		t.Errorf("cached forecast differs: %+v vs %+v", fc2, fc1)
+	}
+	// The hourly window is cut at read time: 3 hours on, the periods before
+	// then are over though the cached forecast is unchanged.
+	k.advance(3 * time.Hour)
+	fc3, err := c.Forecast(ctx, ptLat, ptLon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := testNow.Add(3 * time.Hour); !fc3.Hourly[0].Start.Equal(want) {
+		t.Errorf("first hourly after 3h = %v, want %v", fc3.Hourly[0].Start, want)
+	}
+	if n := f.count("/gridpoints/TST/1,1/forecast"); n != 2 {
+		t.Errorf("forecast requests after 3h = %d, want 2", n)
+	}
+	k.advance(90 * time.Minute) // past the 4h TTL
+	if _, err := c.Forecast(ctx, ptLat, ptLon); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count("/gridpoints/TST/1,1/forecast"); n != 4 {
+		t.Errorf("forecast requests after TTL = %d, want 4", n)
+	}
+}
+
+func TestCacheNoneAlwaysFetches(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	f.periods = []map[string]any{}
+	c, err := NewClient(&Options{UserAgent: testUA, BaseURL: f.srv.URL, Cache: cache.None})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for range 2 {
+		if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Forecast(ctx, ptLat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, s, o, fc := f.count("/points/"), f.count("/gridpoints/TST/1,1/stations"), f.count("/stations/"),
+		f.count("/gridpoints/TST/1,1/forecast"); n != 4 || s != 2 || o != 2 || fc != 4 {
+		t.Errorf("points/stations/obs/forecast requests = %d/%d/%d/%d, want 4/2/2/4", n, s, o, fc)
+	}
+}
+
+func TestFailingStoreDoesNotFailCalls(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	c, st, _ := f.cachedClient(t, Options{})
+	st.failGet, st.failSet = true, true
+	ctx := context.Background()
+	got, err := c.Current(ctx, ptLat, ptLon)
+	if err != nil || len(got) != 1 {
+		t.Errorf("Current = %v, %v", ids(got), err)
+	}
+	if _, err := c.Forecast(ctx, ptLat, ptLon); err != nil {
+		t.Errorf("Forecast: %v", err)
+	}
+}
+
+func TestUndecodableValueIsMiss(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	c, st, _ := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range st.keys() {
+		st.Set(ctx, k, []byte("{not json"), time.Hour)
+	}
+	got, err := c.Current(ctx, ptLat, ptLon)
+	if err != nil || len(got) != 1 {
+		t.Errorf("Current = %v, %v", ids(got), err)
+	}
+	if n := f.count("/points/"); n != 2 {
+		t.Errorf("points requests = %d, want 2", n)
+	}
+}
+
+func TestFailuresNotCached(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	fail := true
+	f.pointsAt = func(w http.ResponseWriter, r *http.Request) bool {
+		if fail {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	c, st, _ := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	if _, err := c.Current(ctx, ptLat, ptLon); err == nil {
+		t.Fatal("Current succeeded")
+	}
+	if _, err := c.Forecast(ctx, ptLat, ptLon); err == nil {
+		t.Fatal("Forecast succeeded")
+	}
+	if ks := st.keys(); len(ks) != 0 {
+		t.Errorf("cached after failures: %v", ks)
+	}
+	fail = false
+	if got, err := c.Current(ctx, ptLat, ptLon); err != nil || len(got) != 1 {
+		t.Errorf("Current after recovery = %v, %v", ids(got), err)
+	}
+
+	// An observation failure for one station isn't cached either.
+	f.pointsAt = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/stations/S0/observations" && fail {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	c, st, _ = f.cachedClient(t, Options{})
+	fail = true
+	if _, err := c.Current(ctx, ptLat, ptLon); err == nil {
+		t.Fatal("Current succeeded")
+	}
+	for _, key := range st.keys() {
+		if strings.Contains(key, ":obs:") {
+			t.Errorf("failed observation cached: %s", key)
+		}
+	}
+	fail = false
+	if got, err := c.Current(ctx, ptLat, ptLon); err != nil || len(got) != 1 {
+		t.Errorf("Current after recovery = %v, %v", ids(got), err)
+	}
+}
+
+func TestCacheKeys(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	f.periods = []map[string]any{}
+	c, st, _ := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	c.Current(ctx, ptLat, ptLon)
+	c.Forecast(ctx, ptLat, ptLon)
+	pfx := "weather:v1:" + f.srv.URL + ":"
+	g := f.srv.URL + "/gridpoints/TST/1,1"
+	want := []string{
+		pfx + "forecast-hourly:" + g + "/forecast/hourly",
+		pfx + "forecast:" + g + "/forecast",
+		pfx + "obs:S0",
+		pfx + "points:34.0000,-84.0000",
+		pfx + "stations:" + g + "/stations",
+	}
+	if got := st.keys(); !eq(got, want) {
+		t.Errorf("keys = %v, want %v", got, want)
+	}
+}
+
+func TestCacheKeyScheme(t *testing.T) {
+	a, _ := NewClient(&Options{UserAgent: testUA, BaseURL: "https://API.example.test"})
+	b, _ := NewClient(&Options{UserAgent: testUA, BaseURL: "http://api.example.test"})
+	if a.cacheKey("obs", "X") != "weather:v1:https://api.example.test:obs:X" || a.cacheKey("obs", "X") == b.cacheKey("obs", "X") {
+		t.Errorf("keys %q, %q", a.cacheKey("obs", "X"), b.cacheKey("obs", "X"))
+	}
+}
+
+func TestChangedStationsLinkRefetches(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	cell := "1,1"
+	f.cellAt = func(string) string { return cell }
+	c, _, k := f.cachedClient(t, Options{PointTTL: time.Hour})
+	ctx := context.Background()
+	c.Current(ctx, ptLat, ptLon)
+	cell = "2,2" // NWS moved the point to another cell
+	c.Current(ctx, ptLat, ptLon)
+	if n := f.count("/gridpoints/TST/2,2/stations"); n != 0 {
+		t.Errorf("new link fetched before the point expired: %d", n)
+	}
+	k.advance(2 * time.Hour)
+	c.Current(ctx, ptLat, ptLon)
+	if n := f.count("/gridpoints/TST/2,2/stations"); n != 1 {
+		t.Errorf("stations requests for the new link = %d, want 1", n)
+	}
+	if n := f.count("/gridpoints/TST/1,1/stations"); n != 1 {
+		t.Errorf("stations requests for the old link = %d, want 1", n)
+	}
+}
+
+func TestEmptyResultsNotCached(t *testing.T) {
+	f := newFake(t)
+	c, st, _ := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	// No stations: a degraded answer must not stick.
+	for range 2 {
+		if got, err := c.Current(ctx, ptLat, ptLon); err != nil || len(got) != 0 {
+			t.Fatalf("got %v, %v", got, err)
+		}
+	}
+	if n := f.count("/gridpoints/TST/1,1/stations"); n != 2 {
+		t.Errorf("stations requests = %d, want 2", n)
+	}
+	for _, k := range st.keys() {
+		if strings.Contains(k, ":stations:") {
+			t.Errorf("empty station list cached: %s", k)
+		}
+	}
+	// A station with no reports.
+	f.stations = stationsAt(1)
+	f.stations[0].obs = nil
+	for range 2 {
+		c.Current(ctx, ptLat, ptLon)
+	}
+	if n := f.count("/stations/S0/observations"); n != 2 {
+		t.Errorf("observation requests = %d, want 2", n)
+	}
+	for _, k := range st.keys() {
+		if strings.Contains(k, ":obs:") {
+			t.Errorf("empty report set cached: %s", k)
+		}
+	}
+}
+
+func TestForecastSharedByCell(t *testing.T) {
+	f := newFake(t)
+	f.periods = []map[string]any{}
+	c, _, _ := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	for _, lat := range []float64{ptLat, ptLat + 0.01} {
+		if _, err := c.Forecast(ctx, lat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := f.count("/points/"); n != 2 {
+		t.Errorf("points requests = %d, want 2", n)
+	}
+	if n := f.count("/gridpoints/TST/1,1/forecast"); n != 2 {
+		t.Errorf("forecast requests = %d, want 2 (one daily, one hourly, shared)", n)
+	}
+}
+
+func TestNegativeTTLDisablesKind(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	c, _, _ := f.cachedClient(t, Options{ObservationTTL: -1})
+	ctx := context.Background()
+	for range 3 {
+		if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if o := f.count("/stations/S0/observations"); o != 3 {
+		t.Errorf("observation requests = %d, want 3", o)
+	}
+	if n, s := f.count("/points/"), f.count("/gridpoints/TST/1,1/stations"); n != 1 || s != 1 {
+		t.Errorf("points/stations requests = %d/%d, want 1/1", n, s)
+	}
+}
+
+func TestCacheKeyIncludesHost(t *testing.T) {
+	f1, f2 := newFake(t), newFake(t)
+	f1.stations, f2.stations = stationsAt(1), stationsAt(1)
+	st := newFakeStore()
+	ctx := context.Background()
+	for _, f := range []*fakeNWS{f1, f2} {
+		c, err := NewClient(&Options{UserAgent: testUA, BaseURL: f.srv.URL, Cache: st})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.now = func() time.Time { return testNow }
+		if _, err := c.Current(ctx, ptLat, ptLon); err != nil {
+			t.Fatal(err)
+		}
+		if n := f.count("/points/"); n != 1 {
+			t.Errorf("points requests to %s = %d, want 1 (hosts must not share entries)", f.srv.URL, n)
+		}
 	}
 }

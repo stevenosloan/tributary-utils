@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stevenosloan/tributary-utils/cache"
+	"github.com/stevenosloan/tributary-utils/internal/cachex"
 	"github.com/stevenosloan/tributary-utils/internal/httpx"
 )
 
@@ -121,6 +122,8 @@ type Client struct {
 	series []Series
 	cache  cache.Store
 	ttl    time.Duration
+
+	keyPrefix string // start of every cache key, from the base URL
 }
 
 // NewClient returns a Client; a nil opts uses defaults.
@@ -150,6 +153,7 @@ func NewClient(opts *Options) *Client {
 			c.ttl = opts.CacheTTL
 		}
 	}
+	c.keyPrefix = cachex.Prefix("modelflow", "v3", c.base)
 	return c
 }
 
@@ -285,25 +289,17 @@ type entry struct {
 	Runs  []Run
 }
 
-// cacheKey includes the base URL's host, so clients on different endpoints
-// can share a Store.
+// cacheKey includes the base URL's scheme and host, so clients on different
+// endpoints can share a Store.
 func (c *Client) cacheKey(comid int, s Series) string {
-	host := c.base
-	if u, err := url.Parse(c.base); err == nil && u.Host != "" {
-		host = u.Host
-	}
-	return "modelflow:v2:" + strings.ToLower(host) + ":" + strconv.Itoa(comid) + ":" + string(s)
+	return c.keyPrefix + strconv.Itoa(comid) + ":" + string(s)
 }
 
 // cached returns the cached entry, or nil on a miss. A store error or an
 // undecodable value is a miss.
 func (c *Client) cached(ctx context.Context, comid int, s Series) *entry {
-	b, ok, err := c.cache.Get(ctx, c.cacheKey(comid, s))
-	if err != nil || !ok {
-		return nil
-	}
 	var e entry
-	if json.Unmarshal(b, &e) != nil {
+	if !cachex.Get(ctx, c.cache, c.cacheKey(comid, s), &e) {
 		return nil
 	}
 	if e.Runs == nil {
@@ -314,11 +310,7 @@ func (c *Client) cached(ctx context.Context, comid int, s Series) *entry {
 
 // store caches e, ignoring a store error.
 func (c *Client) store(ctx context.Context, comid int, s Series, e *entry) {
-	b, err := json.Marshal(e)
-	if err != nil {
-		return
-	}
-	_ = c.cache.Set(ctx, c.cacheKey(comid, s), b, c.ttl)
+	cachex.Set(ctx, c.cache, c.cacheKey(comid, s), e, c.ttl)
 }
 
 // fetch requests one series, retrying once if the failure may be passing.

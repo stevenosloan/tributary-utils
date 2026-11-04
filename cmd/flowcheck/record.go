@@ -132,6 +132,10 @@ func recordSite(ctx context.Context, cfg recordConfig, hc *http.Client, mf *mode
 	}
 	run := flow.Run(modelflow.ShortRange)
 	if run == nil {
+		if err := flow.Errors[modelflow.ShortRange]; err != nil {
+			res.Err = err
+			return res
+		}
 		res.Err = fmt.Errorf("no short-range forecast for comid %d", info.COMID)
 		return res
 	}

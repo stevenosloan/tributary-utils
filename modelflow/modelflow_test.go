@@ -543,7 +543,7 @@ func TestCacheHit(t *testing.T) {
 	if second.Reach.Name != "Amicalola Creek" {
 		t.Errorf("Reach = %+v", second.Reach)
 	}
-	want := "modelflow:v2:" + strings.TrimPrefix(f.srv.URL, "http://") + ":6495864:analysis_assimilation"
+	want := "modelflow:v3:" + f.srv.URL + ":6495864:analysis_assimilation"
 	if _, ok := st.items[want]; !ok {
 		t.Errorf("key %q not set; keys %v", want, st.lastKeys)
 	}
@@ -625,7 +625,7 @@ func TestCacheDoesNotStoreFailures(t *testing.T) {
 	if res.Errors[ShortRange] == nil {
 		t.Fatal("expected short range failure")
 	}
-	if _, ok := st.items["modelflow:v2:"+strings.TrimPrefix(f.srv.URL, "http://")+":6495864:short_range"]; ok {
+	if _, ok := st.items["modelflow:v3:"+f.srv.URL+":6495864:short_range"]; ok {
 		t.Error("failure cached")
 	}
 	res, err := c.Flow(ctx, 6495864)
@@ -647,7 +647,7 @@ func TestFailingStore(t *testing.T) {
 func TestCorruptCacheEntry(t *testing.T) {
 	f := newFake(t, standard)
 	st := newFakeStore()
-	st.Set(ctx, "modelflow:v2:"+strings.TrimPrefix(f.srv.URL, "http://")+":6495864:analysis_assimilation", []byte("garbage"), time.Hour)
+	st.Set(ctx, "modelflow:v3:"+f.srv.URL+":6495864:analysis_assimilation", []byte("garbage"), time.Hour)
 	res, err := client(f, Options{Cache: st, Series: []Series{Analysis}}).Flow(ctx, 6495864)
 	if err != nil || res.Run(Analysis) == nil || f.total() != 1 {
 		t.Errorf("res=%+v err=%v requests=%d", res, err, f.total())
@@ -702,7 +702,7 @@ func TestZonelessTimes(t *testing.T) {
 
 func TestCacheKeyVersion(t *testing.T) {
 	c := NewClient(&Options{BaseURL: "https://api.example.test/v1"})
-	if got := c.cacheKey(5, Analysis); !strings.HasPrefix(got, "modelflow:v2:") {
+	if got := c.cacheKey(5, Analysis); !strings.HasPrefix(got, "modelflow:v3:") {
 		t.Errorf("key = %q", got)
 	}
 }
@@ -710,11 +710,15 @@ func TestCacheKeyVersion(t *testing.T) {
 func TestCacheKeyHost(t *testing.T) {
 	a := NewClient(&Options{BaseURL: "https://API.example.test/v1"})
 	b := NewClient(&Options{BaseURL: "https://other.example.test/v1"})
-	if got := a.cacheKey(5, ShortRange); got != "modelflow:v2:api.example.test:5:short_range" {
+	if got := a.cacheKey(5, ShortRange); got != "modelflow:v3:https://api.example.test:5:short_range" {
 		t.Errorf("key = %q", got)
 	}
 	if a.cacheKey(5, ShortRange) == b.cacheKey(5, ShortRange) {
 		t.Error("keys collide across hosts")
+	}
+	h := NewClient(&Options{BaseURL: "http://api.example.test/v1"})
+	if h.cacheKey(5, ShortRange) == a.cacheKey(5, ShortRange) {
+		t.Error("keys collide across schemes")
 	}
 }
 

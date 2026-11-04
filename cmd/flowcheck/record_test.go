@@ -170,3 +170,29 @@ func TestRunRecordExitCodes(t *testing.T) {
 		t.Errorf("bad command: exit %d", code)
 	}
 }
+
+func TestRecordSurfacesSeriesError(t *testing.T) {
+	f := newFakeUpstreams(t)
+	var out bytes.Buffer
+	// 44444444's short_range series fails with NWPS's "Data unavailable".
+	_ = record(ctx, f.config(t.TempDir(), "44444444"), &out)
+	s := out.String()
+	if !strings.Contains(s, "short_range") || !strings.Contains(s, "data unavailable") || strings.Contains(s, "no short-range forecast") {
+		t.Errorf("want the series error in the output, got:\n%s", s)
+	}
+}
+
+func TestRecordEmptySeriesMessage(t *testing.T) {
+	nwps := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"reach":{"reachId":"1001","name":"R"},"shortRange":null}`)
+	}))
+	defer nwps.Close()
+	f := newFakeUpstreams(t)
+	cfg := f.config(t.TempDir(), "11111111")
+	cfg.NWPSURL = nwps.URL
+	var out bytes.Buffer
+	_ = record(ctx, cfg, &out)
+	if !strings.Contains(out.String(), "no short-range forecast for comid 1001") {
+		t.Errorf("output:\n%s", out.String())
+	}
+}

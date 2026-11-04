@@ -15,7 +15,7 @@ for _, o := range obs {
 }
 fc, err := c.Forecast(ctx, 34.42, -84.22)
 if errors.Is(err, weather.ErrNoCoverage) {
-	// outside the US
+	// outside the US (some open-ocean points give a plain 500 instead)
 }
 ```
 
@@ -45,10 +45,41 @@ otherwise the call returns an `*Error`.
 
 ### Caching
 
-The `points` response and the station list are cached per point (latitude and
-longitude rounded to 4 decimals) for 24 hours, with the station list under the
-same entry and expiry. Observations and forecasts are not cached. Reuse one
-`Client`, which is safe for concurrent use.
+Results are cached in `Options.Cache`, a [`cache.Store`](cache.md): `nil` (the
+default) gives each `Client` its own in-memory store, `cache.None` turns caching
+off, and a shared or remote store can be supplied. Values are JSON.
+
+| What | Key (after the prefix) | TTL option, default |
+|------|-------------------------|---------------------|
+| Grid data of a point: forecast URLs, station list URL, time zone | `points:<lat,lon>` | `PointTTL`, 24 hours (`DefaultPointTTL`) |
+| Stations of the point's grid cell | `stations:<stations URL>` | `PointTTL` |
+| Recent reports of one station (what `Current` reads) | `obs:<stationID>` | `ObservationTTL`, 5 minutes (`DefaultObservationTTL`) |
+| Daily forecast document of a grid cell | `forecast:<forecast URL>` | `ForecastTTL`, 15 minutes (`DefaultForecastTTL`) |
+| Hourly forecast document of a grid cell | `forecast-hourly:<hourly URL>` | `ForecastTTL` |
+
+The prefix is `weather:v1:<scheme>://<host>:` with the base URL's scheme and
+host lowercased (for example `weather:v1:https://api.weather.gov:`), so clients
+on different endpoints can share a store. `<lat,lon>` is the point rounded to 4
+decimals, as in the `points` request. The station list and the forecasts are
+keyed by the link the `points` response gave, so a point whose links change
+fetches fresh ones, and nearby points in one grid cell share them. Observations
+are keyed by station, so nearby points share those too.
+
+Each TTL option defaults when zero. A negative value turns caching off for that
+kind of data (for example `ObservationTTL: -1` always fetches observations
+while points and forecasts stay cached).
+
+What is cached is the decoded upstream data. Anything derived from it is worked
+out on every call against the current time: whether a station's newest report
+is under two hours old, the precipitation totals, the pressure trend, and which
+hourly periods fall in the next 24 hours. A cached report therefore never makes
+"the last hour" mean an hour ago; at worst it is up to `ObservationTTL` behind
+what NWS holds.
+
+Failures and empty results (no stations, a station with no reports) are never
+cached, so a degraded answer doesn't stick for the TTL. A store that errors, or holds a value that doesn't
+decode, is treated as a miss, and a failed write is ignored: a call never fails
+because of the cache. Change the `v1` in the key if the stored shape changes.
 
 ## Current conditions
 
@@ -166,8 +197,12 @@ converted.
 HTTP status (0 when no response arrived), and `Timeout()` reports whether it
 timed out, on our side or as a 504. The default client allows 30s per request.
 
-A 404 from `points`, which NWS gives for a point it doesn't cover (open ocean,
-outside the US), also satisfies `errors.Is(err, weather.ErrNoCoverage)`.
+A 404 from `points`, which NWS gives for a point it doesn't cover outside the
+US, also satisfies `errors.Is(err, weather.ErrNoCoverage)`. NWS does not answer
+every uncovered point that way: for some open-ocean points it answers 500
+"Unexpected Problem" (seen live at 30, -60). That comes back as an ordinary
+`*Error` with `Status` 500, not `ErrNoCoverage`, so don't read a 500 from
+`points` as an NWS outage without checking where the point is.
 
 ## Limits
 

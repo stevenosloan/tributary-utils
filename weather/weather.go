@@ -16,9 +16,10 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/stevenosloan/tributary-utils/cache"
+	"github.com/stevenosloan/tributary-utils/internal/cachex"
 	"github.com/stevenosloan/tributary-utils/internal/httpx"
 )
 
@@ -49,14 +50,23 @@ const maxConcurrent = 4
 // stationLimit is how many stations are requested for a point's grid cell.
 const stationLimit = 30
 
-// pointTTL is how long a point's grid and station data is cached.
-const pointTTL = 24 * time.Hour
+// DefaultPointTTL is how long a point's grid data and station list are cached.
+const DefaultPointTTL = 24 * time.Hour
+
+// DefaultObservationTTL is how long a station's recent reports are cached.
+const DefaultObservationTTL = 5 * time.Minute
+
+// DefaultForecastTTL is how long a point's forecasts are cached.
+const DefaultForecastTTL = 15 * time.Minute
 
 // steadyHPa is the 3-hour pressure change below which the trend is "steady".
 const steadyHPa = 1.0
 
 // ErrNoCoverage is returned (wrapped in an *Error) for a point outside NWS
-// coverage, such as open ocean or outside the US. Test with errors.Is.
+// coverage. NWS answers 404 for a point it doesn't cover outside the US, and
+// that is what this marks. Some open-ocean points get a 500 "Unexpected
+// Problem" instead (seen at 30, -60), which comes back as an ordinary *Error
+// with Status 500 and does not match ErrNoCoverage. Test with errors.Is.
 var ErrNoCoverage = errors.New("point is outside NWS coverage")
 
 // Error reports a failed request to the NWS API.
@@ -138,6 +148,21 @@ type Options struct {
 	UserAgent  string
 	BaseURL    string       // defaults to DefaultBaseURL
 	HTTPClient *http.Client // defaults to a client with a 30s timeout
+	// Cache holds fetched results between calls. nil means a new in-memory
+	// store; cache.None disables caching.
+	Cache cache.Store
+	// PointTTL is how long a point's grid data and station list are kept;
+	// defaults to DefaultPointTTL.
+	PointTTL time.Duration
+	// ObservationTTL is how long a station's recent reports are kept, so
+	// nearby points share them; defaults to DefaultObservationTTL.
+	ObservationTTL time.Duration
+	// ForecastTTL is how long the daily and hourly forecasts of a grid cell
+	// are kept; defaults to DefaultForecastTTL.
+	//
+	// For each TTL, zero means the default and a negative value turns caching
+	// off for that kind of data.
+	ForecastTTL time.Duration
 }
 
 // Client queries the NWS API. It is safe for concurrent use.
@@ -146,28 +171,28 @@ type Client struct {
 	hc   *http.Client
 	ua   string
 
-	now   func() time.Time
-	mu    sync.Mutex
-	cache map[string]*pointEntry // keyed by lat,lon rounded to 4 decimals
+	now func() time.Time
+
+	cache                     cache.Store
+	pointTTL, obsTTL, fcstTTL time.Duration // <= 0: don't cache that kind
+	keyPrefix                 string        // start of every cache key, from the base URL
 }
 
-// pointEntry is the cached grid and station data for a point.
-type pointEntry struct {
-	fetched  time.Time
-	info     pointInfo
-	stations []station // valid only when haveStns is set
-	haveStns bool
-}
-
+// pointInfo is the grid data of a point. It is cached as JSON.
 type pointInfo struct {
-	forecast, hourly, stationsURL string
-	timeZone                      string
+	Forecast    string `json:"forecast"`
+	Hourly      string `json:"hourly"`
+	StationsURL string `json:"stations_url"`
+	TimeZone    string `json:"time_zone"`
 }
 
+// station is cached as JSON.
 type station struct {
-	id, name string
-	lat, lon float64
-	elevM    *float64
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Lat   float64  `json:"lat"`
+	Lon   float64  `json:"lon"`
+	ElevM *float64 `json:"elev_m"`
 }
 
 // NewClient returns a Client. Unlike readings.NewClient it takes a required
@@ -179,13 +204,27 @@ func NewClient(opts *Options) (*Client, error) {
 		return nil, errors.New("weather: Options.UserAgent is required, in the form \"(app name, contact)\"")
 	}
 	c := &Client{base: DefaultBaseURL, hc: &http.Client{Timeout: 30 * time.Second},
-		ua: strings.TrimSpace(opts.UserAgent), now: time.Now, cache: map[string]*pointEntry{}}
+		ua: strings.TrimSpace(opts.UserAgent), now: time.Now, cache: cache.NewMemory(),
+		pointTTL: DefaultPointTTL, obsTTL: DefaultObservationTTL, fcstTTL: DefaultForecastTTL}
 	if opts.BaseURL != "" {
 		c.base = strings.TrimRight(opts.BaseURL, "/")
 	}
 	if opts.HTTPClient != nil {
 		c.hc = opts.HTTPClient
 	}
+	if opts.Cache != nil {
+		c.cache = opts.Cache
+	}
+	if opts.PointTTL != 0 {
+		c.pointTTL = opts.PointTTL
+	}
+	if opts.ObservationTTL != 0 {
+		c.obsTTL = opts.ObservationTTL
+	}
+	if opts.ForecastTTL != 0 {
+		c.fcstTTL = opts.ForecastTTL
+	}
+	c.keyPrefix = cachex.Prefix("weather", "v1", c.base)
 	return c, nil
 }
 
@@ -204,14 +243,16 @@ func NewClient(opts *Options) (*Client, error) {
 // station whose request fails is skipped, unless no station could be read, in
 // which case the first error is returned.
 //
-// The point's grid data and station list are cached on the Client for 24
-// hours, so reuse one Client.
+// Results are cached as set out in Options: the point's grid data and station
+// list, and each station's recent reports. What is derived from the reports
+// (the newest report's age, precipitation totals, pressure trend) is worked
+// out on each call against the current time.
 func (c *Client) Current(ctx context.Context, lat, lon float64) ([]Observation, error) {
-	e, err := c.point(ctx, lat, lon)
+	info, err := c.point(ctx, lat, lon)
 	if err != nil {
 		return nil, err
 	}
-	stations, err := c.stations(ctx, lat, lon, e)
+	stations, err := c.stations(ctx, info)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +263,7 @@ func (c *Client) Current(ctx context.Context, lat, lon float64) ([]Observation, 
 	}
 	var cands []cand
 	for _, s := range stations {
-		if km := haversineKm(lat, lon, s.lat, s.lon); km <= maxStationKm {
+		if km := haversineKm(lat, lon, s.Lat, s.Lon); km <= maxStationKm {
 			cands = append(cands, cand{s, km})
 		}
 	}
@@ -241,7 +282,7 @@ func (c *Client) Current(ctx context.Context, lat, lon float64) ([]Observation, 
 		fns := make([]func(context.Context) error, len(batch))
 		for i, b := range batch {
 			fns[i] = func(ctx context.Context) error {
-				reports, err := c.observations(ctx, b.st.id)
+				reports, err := c.observations(ctx, b.st.ID)
 				if err != nil {
 					errs[i] = err
 					return nil
@@ -275,26 +316,28 @@ func (c *Client) Current(ctx context.Context, lat, lon float64) ([]Observation, 
 
 // Forecast returns the 12-hour forecast periods for the point and the hourly
 // forecast for the next 24 hours, with temperatures in degrees Celsius. The
-// point's grid data is cached as for Current.
+// point's grid data and the two forecasts are cached as set out in Options;
+// the hourly window is cut from the cached forecast on each call, relative to
+// the current time.
 func (c *Client) Forecast(ctx context.Context, lat, lon float64) (*Forecast, error) {
-	e, err := c.point(ctx, lat, lon)
+	info, err := c.point(ctx, lat, lon)
 	if err != nil {
 		return nil, err
 	}
 	var daily, hourly forecastDoc
 	err = httpx.Parallel(ctx, maxConcurrent,
 		func(ctx context.Context) error {
-			return c.getFollow(ctx, "forecast", withQuery(e.info.forecast, "units=si"), &daily)
+			return c.forecastDoc(ctx, "forecast", info.Forecast, &daily)
 		},
 		func(ctx context.Context) error {
-			return c.getFollow(ctx, "forecast-hourly", withQuery(e.info.hourly, "units=si"), &hourly)
+			return c.forecastDoc(ctx, "forecast-hourly", info.Hourly, &hourly)
 		})
 	if err != nil {
 		return nil, err
 	}
 
 	now := c.now()
-	f := &Forecast{TimeZone: e.info.timeZone}
+	f := &Forecast{TimeZone: info.TimeZone}
 	if t, err := time.Parse(time.RFC3339, daily.Properties.UpdateTime); err == nil {
 		f.Updated = t
 	}
@@ -310,6 +353,41 @@ func (c *Client) Forecast(ctx context.Context, lat, lon float64) (*Forecast, err
 		}
 	}
 	return f, nil
+}
+
+// forecastDoc returns the forecast document op ("forecast" or
+// "forecast-hourly") at link, from the cache or from NWS. It is keyed by the
+// link, which is for the point's grid cell, so nearby points share it.
+func (c *Client) forecastDoc(ctx context.Context, op, link string, dst *forecastDoc) error {
+	key := c.cacheKey(op, link)
+	if c.cacheGet(ctx, key, c.fcstTTL, dst) {
+		return nil
+	}
+	var doc forecastDoc
+	if err := c.getFollow(ctx, op, withQuery(link, "units=si"), &doc); err != nil {
+		return err
+	}
+	*dst = doc
+	c.cacheSet(ctx, key, doc, c.fcstTTL)
+	return nil
+}
+
+// cacheKey is the store key for a kind of data and its id.
+func (c *Client) cacheKey(kind, id string) string { return c.keyPrefix + kind + ":" + id }
+
+// cacheGet decodes the JSON value under key into dst, reporting whether it
+// did. A store error or an undecodable value is a miss, and so is any lookup
+// when ttl is not positive (caching for that kind is off).
+func (c *Client) cacheGet(ctx context.Context, key string, ttl time.Duration, dst any) bool {
+	return ttl > 0 && cachex.Get(ctx, c.cache, key, dst)
+}
+
+// cacheSet stores v as JSON, ignoring a store error. It does nothing when ttl
+// is not positive.
+func (c *Client) cacheSet(ctx context.Context, key string, v any, ttl time.Duration) {
+	if ttl > 0 {
+		cachex.Set(ctx, c.cache, key, v, ttl)
+	}
 }
 
 type forecastDoc struct {
@@ -361,19 +439,17 @@ func withQuery(u, q string) string {
 	return u + "?" + q
 }
 
-// point returns the cached grid data for a point, fetching it if missing or
-// older than 24 hours.
-func (c *Client) point(ctx context.Context, lat, lon float64) (pointEntry, error) {
+// point returns the grid data for a point, from the cache or from NWS.
+func (c *Client) point(ctx context.Context, lat, lon float64) (pointInfo, error) {
 	if math.IsNaN(lat) || math.IsNaN(lon) || math.Abs(lat) > 90 || math.Abs(lon) > 180 {
-		return pointEntry{}, &Error{Op: "points", Err: fmt.Errorf("invalid coordinates %v, %v", lat, lon)}
+		return pointInfo{}, &Error{Op: "points", Err: fmt.Errorf("invalid coordinates %v, %v", lat, lon)}
 	}
-	key := pointKey(lat, lon)
-	c.mu.Lock()
-	if e, ok := c.cache[key]; ok && c.now().Sub(e.fetched) < pointTTL {
-		defer c.mu.Unlock()
-		return *e, nil
+	pt := pointKey(lat, lon)
+	key := c.cacheKey("points", pt)
+	var info pointInfo
+	if c.cacheGet(ctx, key, c.pointTTL, &info) && info.Forecast != "" && info.Hourly != "" && info.StationsURL != "" {
+		return info, nil
 	}
-	c.mu.Unlock()
 
 	var doc struct {
 		Properties struct {
@@ -383,39 +459,34 @@ func (c *Client) point(ctx context.Context, lat, lon float64) (pointEntry, error
 			TimeZone            string `json:"timeZone"`
 		} `json:"properties"`
 	}
-	if err := c.get(ctx, "points", c.base+"/points/"+key, &doc); err != nil {
+	if err := c.get(ctx, "points", c.base+"/points/"+pt, &doc); err != nil {
 		var ee *Error
 		if errors.As(err, &ee) && ee.Status == http.StatusNotFound {
 			ee.Err = fmt.Errorf("%w: %v", ErrNoCoverage, ee.Err)
 		}
-		return pointEntry{}, err
+		return pointInfo{}, err
 	}
 	p := doc.Properties
 	for _, l := range []struct{ name, u string }{{"forecast", p.Forecast}, {"forecastHourly", p.ForecastHourly}, {"observationStations", p.ObservationStations}} {
 		if l.u == "" || !c.onBase(l.u) {
-			return pointEntry{}, &Error{Op: "points", Err: fmt.Errorf("%s link %q is not on %s", l.name, httpx.Truncate(l.u, 200), c.base)}
+			return pointInfo{}, &Error{Op: "points", Err: fmt.Errorf("%s link %q is not on %s", l.name, httpx.Truncate(l.u, 200), c.base)}
 		}
 	}
-	e := &pointEntry{fetched: c.now(), info: pointInfo{forecast: p.Forecast, hourly: p.ForecastHourly,
-		stationsURL: p.ObservationStations, timeZone: p.TimeZone}}
-	c.mu.Lock()
-	for k, old := range c.cache { // drop expired entries so the cache stays bounded
-		if e.fetched.Sub(old.fetched) >= pointTTL {
-			delete(c.cache, k)
-		}
-	}
-	c.cache[key] = e
-	c.mu.Unlock()
-	return *e, nil
+	info = pointInfo{Forecast: p.Forecast, Hourly: p.ForecastHourly,
+		StationsURL: p.ObservationStations, TimeZone: p.TimeZone}
+	c.cacheSet(ctx, key, info, c.pointTTL)
+	return info, nil
 }
 
 func pointKey(lat, lon float64) string { return fmt.Sprintf("%.4f,%.4f", lat, lon) }
 
-// stations returns the stations for a point's grid cell, from the cache entry
-// if present.
-func (c *Client) stations(ctx context.Context, lat, lon float64, e pointEntry) ([]station, error) {
-	if e.haveStns {
-		return e.stations, nil
+// stations returns the stations for a point's grid cell, from the cache or
+// from NWS. The list is keyed by the stations link the points response gave.
+func (c *Client) stations(ctx context.Context, info pointInfo) ([]station, error) {
+	key := c.cacheKey("stations", info.StationsURL)
+	var cached []station
+	if c.cacheGet(ctx, key, c.pointTTL, &cached) && len(cached) > 0 {
+		return cached, nil
 	}
 	var doc struct {
 		Features []struct {
@@ -429,23 +500,21 @@ func (c *Client) stations(ctx context.Context, lat, lon float64, e pointEntry) (
 			} `json:"properties"`
 		} `json:"features"`
 	}
-	if err := c.getFollow(ctx, "stations", withQuery(e.info.stationsURL, fmt.Sprintf("limit=%d", stationLimit)), &doc); err != nil {
+	if err := c.getFollow(ctx, "stations", withQuery(info.StationsURL, fmt.Sprintf("limit=%d", stationLimit)), &doc); err != nil {
 		return nil, err
 	}
-	var out []station
+	out := []station{}
 	for _, f := range doc.Features {
 		p := f.Properties
 		if p.ID == "" || len(f.Geometry.Coordinates) < 2 {
 			continue
 		}
-		out = append(out, station{id: p.ID, name: p.Name, lon: f.Geometry.Coordinates[0],
-			lat: f.Geometry.Coordinates[1], elevM: p.Elevation.convert(unitMetres)})
+		out = append(out, station{ID: p.ID, Name: p.Name, Lon: f.Geometry.Coordinates[0],
+			Lat: f.Geometry.Coordinates[1], ElevM: p.Elevation.convert(unitMetres)})
 	}
-	c.mu.Lock()
-	if cur, ok := c.cache[pointKey(lat, lon)]; ok && cur.fetched.Equal(e.fetched) {
-		cur.stations, cur.haveStns = out, true
+	if len(out) > 0 {
+		c.cacheSet(ctx, key, out, c.pointTTL)
 	}
-	c.mu.Unlock()
 	return out, nil
 }
 
@@ -582,14 +651,32 @@ type obsProps struct {
 
 // report is a parsed observation.
 type report struct {
-	t time.Time
-	p obsProps
+	T time.Time `json:"t"`
+	P obsProps  `json:"p"`
 }
 
-// observations fetches a station's recent reports, newest first.
+// observations returns a station's recent reports, newest first, from the
+// cache or from NWS.
+func (c *Client) observations(ctx context.Context, id string) ([]report, error) {
+	key := c.cacheKey("obs", id)
+	var rs []report
+	if c.cacheGet(ctx, key, c.obsTTL, &rs) && len(rs) > 0 {
+		return rs, nil
+	}
+	rs, err := c.fetchObservations(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(rs) > 0 {
+		c.cacheSet(ctx, key, rs, c.obsTTL)
+	}
+	return rs, nil
+}
+
+// fetchObservations requests a station's recent reports, newest first.
 // 500 is the most NWS returns per request; it covers the 26 hour lookback even
 // at a 5-minute cadence (about 312 reports), so pagination links are ignored.
-func (c *Client) observations(ctx context.Context, id string) ([]report, error) {
+func (c *Client) fetchObservations(ctx context.Context, id string) ([]report, error) {
 	start := c.now().Add(-lookback).UTC().Format(time.RFC3339)
 	u := c.base + "/stations/" + url.PathEscape(id) + "/observations?limit=500&start=" + url.QueryEscape(start)
 	var doc struct {
@@ -606,20 +693,20 @@ func (c *Client) observations(ctx context.Context, id string) ([]report, error) 
 			rs = append(rs, report{t, f.Properties})
 		}
 	}
-	sort.SliceStable(rs, func(i, j int) bool { return rs[i].t.After(rs[j].t) })
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].T.After(rs[j].T) })
 	return rs, nil
 }
 
 // summarize builds the Observation for a station from its reports, newest
 // first. It returns nil if there are none or the newest is older than maxAge.
 func summarize(st station, km float64, rs []report, now time.Time) *Observation {
-	if len(rs) == 0 || now.Sub(rs[0].t) > maxAge {
+	if len(rs) == 0 || now.Sub(rs[0].T) > maxAge {
 		return nil
 	}
-	p := rs[0].p
+	p := rs[0].P
 	o := &Observation{
-		StationID: st.id, StationName: st.name, Lat: st.lat, Lon: st.lon,
-		DistanceKm: km, ElevationM: st.elevM, Time: rs[0].t, Description: p.Description,
+		StationID: st.ID, StationName: st.Name, Lat: st.Lat, Lon: st.Lon,
+		DistanceKm: km, ElevationM: st.ElevM, Time: rs[0].T, Description: p.Description,
 		TemperatureC:     p.Temperature.convert(unitTemp),
 		DewpointC:        p.Dewpoint.convert(unitTemp),
 		HumidityPct:      p.Humidity.convert(unitPercent),
@@ -644,21 +731,21 @@ func summarize(st station, km float64, rs []report, now time.Time) *Observation 
 // pressureTrend compares the newest report's pressure with that of the report
 // closest to 3 hours earlier, within 30 minutes either way.
 func pressureTrend(rs []report, pick func(obsProps) *float64) (string, *float64) {
-	now := pick(rs[0].p)
+	now := pick(rs[0].P)
 	if now == nil {
 		return "", nil
 	}
-	target := rs[0].t.Add(-3 * time.Hour)
+	target := rs[0].T.Add(-3 * time.Hour)
 	var (
 		best     *float64
 		bestDiff = 30*time.Minute + 1
 	)
 	for _, r := range rs[1:] {
-		d := r.t.Sub(target)
+		d := r.T.Sub(target)
 		if d < 0 {
 			d = -d
 		}
-		if v := pick(r.p); v != nil && d < bestDiff {
+		if v := pick(r.P); v != nil && d < bestDiff {
 			best, bestDiff = v, d
 		}
 	}
@@ -709,21 +796,21 @@ func precipTotals(rs []report, now time.Time) precipitation {
 	byHour := map[time.Time]*obsProps{}
 	var anchor *report
 	for i, r := range rs { // newest first, so the first per hour is the latest
-		if r.t.UTC().Minute() < 45 || r.p.Precip1h == nil {
+		if r.T.UTC().Minute() < 45 || r.P.Precip1h == nil {
 			continue
 		}
-		hr := r.t.UTC().Truncate(time.Hour)
-		if old, ok := byHour[hr]; !ok || (old.RawMessage == "" && r.p.RawMessage != "") {
-			byHour[hr] = &rs[i].p
+		hr := r.T.UTC().Truncate(time.Hour)
+		if old, ok := byHour[hr]; !ok || (old.RawMessage == "" && r.P.RawMessage != "") {
+			byHour[hr] = &rs[i].P
 		}
 		if anchor == nil {
 			anchor = &rs[i]
 		}
 	}
-	if anchor == nil || now.Sub(anchor.t) > maxAge {
+	if anchor == nil || now.Sub(anchor.T) > maxAge {
 		return precipitation{miss6: 6, miss24: 24}
 	}
-	end := anchor.t.UTC().Truncate(time.Hour)
+	end := anchor.T.UTC().Truncate(time.Hour)
 	sum := func(hours int) (*float64, int) {
 		total, known := 0.0, 0
 		for i := range hours {

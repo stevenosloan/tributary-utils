@@ -122,14 +122,14 @@ turns caching off, and a shared or remote store can be supplied.
 
 | | |
 |-|-|
-| Key | `modelflow:v2:<host>:<comid>:<series>`, the host of the base URL lowercased, so clients on different endpoints can share a store |
+| Key | `modelflow:v3:<scheme>://<host>:<comid>:<series>`, the base URL's scheme and host lowercased, so clients on different endpoints can share a store |
 | Value | JSON of the reach and the series' runs |
 | TTL | `Options.CacheTTL`, default 15 minutes |
 
 An empty series is cached too, so an empty medium range isn't requested again
 on every call. Failures are never cached. A store that errors, or holds a value
 that doesn't decode, is treated as a miss, and a failed write is ignored:
-`Flow` never fails because of the cache. Change the `v2` in the key if the
+`Flow` never fails because of the cache. Change the `v3` in the key if the
 stored shape changes.
 
 ## Accuracy
