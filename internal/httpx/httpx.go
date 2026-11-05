@@ -1,5 +1,5 @@
-// Package httpx holds the HTTP plumbing shared by the gauges and readings
-// packages.
+// Package httpx holds the HTTP plumbing shared by the packages in this
+// module.
 package httpx
 
 import (

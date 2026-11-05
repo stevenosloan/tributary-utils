@@ -212,6 +212,59 @@ func (c *Client) Latest(ctx context.Context, siteNos []string) (map[string][]Rea
 	return out, nil
 }
 
+// Value is one past value of a gauge's time series.
+type Value struct {
+	Time       time.Time
+	Value      float64
+	Unit       string   // e.g. "ft^3/s"
+	Approval   string   // "Provisional" or "Approved"
+	Qualifiers []string // e.g. "ICE", "EQUIP"
+	SeriesID   string   // time series ID, to tell sensors apart
+}
+
+// History returns the continuous (e.g. 15-minute) values a gauge reported for
+// one parameter (e.g. "00060", discharge) between start and end, sorted by
+// time. siteNo is as for Latest. A gauge with no values in the window gives an
+// empty result, not an error. Values that are missing, NaN or infinite, or
+// equal to the -999999 sentinel are left out.
+//
+// If the gauge has several series for the parameter (multiple sensors), the
+// values of all of them are returned, each with its SeriesID; filter on it to
+// pick one. An empty site or parameter code, or a start that isn't before
+// end (compared to the second, as the request is), is an *Error without a
+// request.
+func (c *Client) History(ctx context.Context, siteNo, parameterCode string, start, end time.Time) ([]Value, error) {
+	const op = "continuous"
+	site := strings.TrimPrefix(strings.TrimSpace(siteNo), "USGS-")
+	code := strings.TrimSpace(parameterCode)
+	switch {
+	case site == "":
+		return nil, &Error{Op: op, Err: fmt.Errorf("empty site number")}
+	case code == "":
+		return nil, &Error{Op: op, Err: fmt.Errorf("empty parameter code")}
+	case !start.Truncate(time.Second).Before(end.Truncate(time.Second)):
+		return nil, &Error{Op: op, Err: fmt.Errorf("start %s is not before end %s", start.Format(time.RFC3339), end.Format(time.RFC3339))}
+	}
+	q := url.Values{
+		"monitoring_location_id": {"USGS-" + site},
+		"parameter_code":         {code},
+		"time":                   {start.UTC().Format(time.RFC3339) + "/" + end.UTC().Format(time.RFC3339)},
+	}
+	var props []valueProps
+	if err := fetch(ctx, c, op, q, &props); err != nil {
+		return nil, err
+	}
+	out := []Value{}
+	for _, v := range props {
+		if r, ok := v.reading(metaProps{}); ok {
+			out = append(out, Value{Time: r.Time, Value: r.Value, Unit: r.Unit,
+				Approval: r.Approval, Qualifiers: r.Qualifiers, SeriesID: r.SeriesID})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	return out, nil
+}
+
 // chunk splits ids into comma-joined groups of at most sitesPerRequest.
 func chunk(ids []string) []string {
 	var out []string

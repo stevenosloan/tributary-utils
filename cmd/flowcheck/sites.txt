@@ -1,0 +1,16 @@
+# Gauges for checking NWM short-range forecasts. Labels group the report:
+# headwaters react to rain and clear it fast; large rivers and tailwaters react slowly.
+02390000 headwater   # Amicalola Creek near Dawsonville, GA
+03460000 headwater   # Cataloochee Creek near Cataloochee, NC
+02138500 headwater   # Linville River near Nebo, NC
+01420500 mid         # Beaver Kill at Cooks Falls, NY (NLDI reach is named Cook Brook)
+03528000 mid         # Clinch River above Tazewell, TN
+07056000 mid         # Buffalo River near St. Joe, AR
+12134500 mid         # Skykomish River near Gold Bar, WA
+07057500 mid         # North Fork River near Tecumseh, MO
+01013500 mid         # Fish River near Fort Kent, ME
+01646500 large       # Potomac River near Washington, DC (Little Falls)
+01434000 large       # Delaware River at Port Jervis, NY
+06191500 large       # Yellowstone River at Corwin Springs, MT
+06041000 tailwater   # Madison River below Ennis Lake near McAllister, MT
+11370500 tailwater   # Sacramento River at Keswick, CA
