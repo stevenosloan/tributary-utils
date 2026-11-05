@@ -21,15 +21,22 @@ git diff --stat "$last"..main
 
 If there are no commits since `$last`, stop: nothing to release.
 
-## 2. Choose the bump (semver)
+## 2. Choose the bump
 
-We are on `v0.x`: the API is unstable, so the usual rules shift down one level.
+While on `v0.x`, `0` is treated as the major version: `v0.MINOR.PATCH` works
+like `MAJOR.MINOR` in semver, so a new feature takes a minor. This differs
+from the common `v0` convention (breaking changes take a minor, additions a
+patch), which this module used through `v0.2.0`.
 
 | Change since last tag | Bump while `v0.x` | At `v1.0.0`+ |
 | --- | --- | --- |
-| Breaking: removed/renamed/re-typed exported identifier, changed behavior callers rely on, new required arg, raised `go` directive | **minor** (`0.1.0` -> `0.2.0`) | major |
-| New exported API or package, backward-compatible | **patch** (`0.1.0` -> `0.1.1`) | minor |
-| Bug fix, docs, CI, internal refactor, no API change | **patch** | patch |
+| New exported API or package, backward-compatible | **minor** (`0.3.0` -> `0.4.0`) | minor |
+| Bug fix, docs, CI, internal refactor, no API change | **patch** (`0.3.0` -> `0.3.1`) | patch |
+| Breaking: removed/renamed/re-typed exported identifier, changed behavior callers rely on, new required arg, raised `go` directive | **minor**, and say it's breaking in the tag message | major |
+
+A breaking change has no bump of its own below `1.0`, so the tag message is
+what tells consumers. Start it with `BREAKING:` and name what changed, for
+example `v0.4.0: BREAKING: <identifier> <what changed>`.
 
 Rules of thumb:
 - Look at the **exported API diff**, not the commit messages. Check with
