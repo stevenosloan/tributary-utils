@@ -98,3 +98,7 @@ Details: [docs/modelflow.md](docs/modelflow.md), [docs/flowcheck.md](docs/flowch
 A small `Store` interface (bytes with a TTL) that `weather` and `modelflow`
 cache through, with an in-memory default; pass your own to share a cache.
 Details: [docs/cache.md](docs/cache.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
