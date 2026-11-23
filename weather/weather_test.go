@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -43,6 +44,7 @@ type fakeNWS struct {
 	mu       sync.Mutex
 	stations []fakeStation
 	hits     map[string]int
+	obsQ     []url.Values // query of each observations request
 	agents   []string
 	periods  []map[string]any
 	hourly   []map[string]any
@@ -81,6 +83,9 @@ func (f *fakeNWS) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.agents = append(f.agents, r.Header.Get("User-Agent"))
 	f.hits[r.URL.Path]++
+	if strings.HasSuffix(r.URL.Path, "/observations") {
+		f.obsQ = append(f.obsQ, r.URL.Query())
+	}
 	f.mu.Unlock()
 	if f.pointsAt != nil && f.pointsAt(w, r) {
 		return
@@ -1310,4 +1315,190 @@ func TestSummarizeSkipsUnparsedReport(t *testing.T) {
 			t.Fatalf("got %+v", o)
 		}
 	})
+}
+
+// obsTS is a report at an absolute time with a temperature and pressure.
+func obsTS(ts time.Time, temp, hpa float64, extra map[string]any) map[string]any {
+	o := map[string]any{
+		"timestamp":          ts.Format(time.RFC3339),
+		"textDescription":    "Clear",
+		"temperature":        qty(temp, "wmoUnit:degC"),
+		"barometricPressure": qty(hpa*100, "wmoUnit:Pa"),
+	}
+	for k, v := range extra {
+		o[k] = v
+	}
+	return o
+}
+
+// atT is the time the At tests ask about; testNow is the client's clock.
+var atT = time.Date(2026, 11, 4, 15, 30, 0, 0, time.UTC)
+
+func TestAtWindowAndLatestReportAtOrBeforeT(t *testing.T) {
+	f := newFake(t)
+	f.stations = []fakeStation{{id: "S0", lat: ptLat + 0.1, obs: []map[string]any{
+		obsTS(atT.Add(20*time.Minute), 30, 1000, nil), // after t: ignored
+		obsTS(atT, 12, 1010, nil),                     // exactly t: used
+		obsTS(atT.Add(-40*time.Minute), 11, 1009, nil),
+		obsTS(atT.Add(-3*time.Hour), 8, 1005, nil),
+	}}}
+	got, err := f.client(t).At(context.Background(), ptLat, ptLon, atT)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	o := got[0]
+	if o.TemperatureC == nil || *o.TemperatureC != 12 || !o.Time.Equal(atT) {
+		t.Errorf("used report at %v temp %v, want the one at %v with 12", o.Time, o.TemperatureC, atT)
+	}
+	if o.PressureTrend != "rising" || o.PressureChangeHPa == nil || *o.PressureChangeHPa != 5 {
+		t.Errorf("trend = %q %v, want rising 5 (as of t)", o.PressureTrend, o.PressureChangeHPa)
+	}
+	if len(f.obsQ) != 1 {
+		t.Fatalf("observation requests = %d, want 1", len(f.obsQ))
+	}
+	q := f.obsQ[0]
+	if q.Get("start") != "2026-11-03T13:00:00Z" || q.Get("end") != "2026-11-04T16:00:00Z" || q.Get("limit") != "500" {
+		t.Errorf("query = %v, want start 2026-11-03T13:00:00Z end 2026-11-04T16:00:00Z limit 500", q)
+	}
+}
+
+func TestAtSkipsStationStaleAtT(t *testing.T) {
+	f := newFake(t)
+	f.stations = []fakeStation{
+		{id: "OLD", lat: ptLat + 0.1, obs: []map[string]any{
+			obsTS(atT.Add(10*time.Minute), 20, 1000, nil), // fresh now, but after t
+			obsTS(atT.Add(-2*time.Hour-time.Minute), 10, 1000, nil),
+		}},
+		{id: "OK", lat: ptLat + 0.2, obs: []map[string]any{
+			obsTS(atT.Add(-2*time.Hour), 10, 1000, nil),
+		}},
+	}
+	got, err := f.client(t).At(context.Background(), ptLat, ptLon, atT)
+	if err != nil || !eq(ids(got), []string{"OK"}) {
+		t.Fatalf("got %v, %v; want only OK", ids(got), err)
+	}
+}
+
+func TestAtRainAsOfT(t *testing.T) {
+	f := newFake(t)
+	// Hourly reports at :53, 1 mm each, from 14:53 on 3 Nov through 19:53 on 4 Nov.
+	var obs []map[string]any
+	for h := time.Date(2026, 11, 4, 19, 53, 0, 0, time.UTC); h.After(testNow.Add(-30 * time.Hour)); h = h.Add(-time.Hour) {
+		mm := 1.0
+		if h.After(atT) {
+			mm = 50 // rain after t must not count
+		}
+		obs = append(obs, obsTS(h, 10, 1010, map[string]any{"precipitationLastHour": qty(mm, "wmoUnit:mm")}))
+	}
+	f.stations = []fakeStation{{id: "S0", lat: ptLat + 0.1, obs: obs}}
+	// t = 15:30; newest routine report at or before it is 14:53.
+	got, err := f.client(t).At(context.Background(), ptLat, ptLon, atT)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	o := got[0]
+	if o.PrecipLast1hMm == nil || *o.PrecipLast1hMm != 1 || o.PrecipLast6hMm == nil || *o.PrecipLast6hMm != 6 ||
+		o.PrecipLast24hMm == nil || *o.PrecipLast24hMm != 24 || o.PrecipLast24hMissingHours != 0 {
+		t.Errorf("rain 1/6/24 = %v/%v/%v (+%d), want 1/6/24 with none missing",
+			o.PrecipLast1hMm, o.PrecipLast6hMm, o.PrecipLast24hMm, o.PrecipLast24hMissingHours)
+	}
+}
+
+func TestAtTooOldMakesNoRequest(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1)
+	c := f.client(t)
+	_, err := c.At(context.Background(), ptLat, ptLon, testNow.Add(-historyLimit-time.Second))
+	if !errors.Is(err, ErrTooOld) {
+		t.Fatalf("err = %v, want ErrTooOld", err)
+	}
+	if n := f.count("/"); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+	// Right at the edge is allowed.
+	if _, err := c.At(context.Background(), ptLat, ptLon, testNow.Add(-historyLimit)); err != nil {
+		t.Errorf("at the edge: %v", err)
+	}
+}
+
+func TestAtFuture(t *testing.T) {
+	f := newFake(t)
+	f.stations = stationsAt(1) // report 10 minutes before testNow
+	c := f.client(t)
+	ctx := context.Background()
+	_, err := c.At(ctx, ptLat, ptLon, testNow.Add(2*time.Minute))
+	if err == nil || errors.Is(err, ErrTooOld) {
+		t.Errorf("2m ahead: err = %v, want a future-time error", err)
+	}
+	got, err := c.At(ctx, ptLat, ptLon, testNow.Add(5*time.Second))
+	if err != nil || len(got) != 1 {
+		t.Errorf("5s ahead: got %v, %v; want one station", got, err)
+	}
+}
+
+func TestAtCachesPerStationPerHour(t *testing.T) {
+	f := newFake(t)
+	f.stations = []fakeStation{
+		{id: "S0", lat: ptLat + 0.1, obs: []map[string]any{obsTS(atT.Add(-10*time.Minute), 10, 1010, nil)}},
+		{id: "S1", lat: ptLat + 0.2, obs: []map[string]any{obsTS(atT.Add(-10*time.Minute), 10, 1010, nil)}},
+	}
+	c, st, _ := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	for _, at := range []time.Time{atT, atT.Add(10 * time.Minute), atT.Add(-25 * time.Minute)} {
+		if _, err := c.At(ctx, ptLat, ptLon, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := f.count("/stations/"); n != 2 {
+		t.Errorf("requests for one hour = %d, want 2 (one per station)", n)
+	}
+	if _, err := c.At(ctx, ptLat, ptLon, atT.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.count("/stations/"); n != 4 {
+		t.Errorf("requests after a different hour = %d, want 4", n)
+	}
+	var found bool
+	for _, k := range st.keys() {
+		found = found || strings.HasSuffix(k, "obsat:S0:2026-11-04T15:00:00Z")
+	}
+	if !found {
+		t.Errorf("no obsat cache key for S0 and hour 15:00; keys %v", st.keys())
+	}
+}
+
+func TestAtKeepsSettledHoursLonger(t *testing.T) {
+	open, settled := testNow.Add(-30*time.Minute), testNow.Add(-5*time.Hour)
+	f := newFake(t)
+	f.stations = []fakeStation{{id: "S0", lat: ptLat + 0.1, obs: []map[string]any{
+		obsTS(open.Add(-10*time.Minute), 10, 1010, nil),
+		obsTS(settled.Add(-10*time.Minute), 10, 1010, nil),
+	}}}
+	c, _, k := f.cachedClient(t, Options{})
+	ctx := context.Background()
+	at := func() {
+		t.Helper()
+		for _, ts := range []time.Time{open, settled} {
+			if _, err := c.At(ctx, ptLat, ptLon, ts); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	at()
+	if n := f.count("/stations/"); n != 2 {
+		t.Fatalf("first requests = %d, want 2", n)
+	}
+	// Past ObservationTTL (5 minutes): the open hour is fetched again, the
+	// settled one is still cached.
+	k.advance(10 * time.Minute)
+	at()
+	if n := f.count("/stations/"); n != 3 {
+		t.Errorf("requests after 10 minutes = %d, want 3", n)
+	}
+	// Past pastObservationTTL: both are fetched again.
+	k.advance(time.Hour)
+	at()
+	if n := f.count("/stations/"); n != 5 {
+		t.Errorf("requests after 70 minutes = %d, want 5", n)
+	}
 }

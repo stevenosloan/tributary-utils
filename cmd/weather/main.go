@@ -4,6 +4,11 @@
 //
 //	go run ./cmd/weather -ua "(example.com, contact@example.com)" 34.42 -84.22
 //	go run ./cmd/weather -forecast -json 34.42 -84.22
+//	go run ./cmd/weather -at 2026-11-22T08:30:00-05:00 34.42 -84.22
+//
+// -at shows the conditions as of a past time within the last 7 days, given as
+// RFC 3339 or as a local time without a zone ("2026-11-22T08:30" or
+// "2026-11-22 08:30", optionally with seconds). With -forecast the forecast is still the current one.
 //
 // In the table, PRECIP shows the 1, 6 and 24 hour totals in mm as 1h/6h/24h.
 // A 6 or 24 hour total with unknown hours is followed by "+Nh?", e.g.
@@ -28,6 +33,7 @@ func main() {
 	ua := flag.String("ua", os.Getenv("NWS_USER_AGENT"), `User-Agent for NWS, "(app name, contact)" (default $NWS_USER_AGENT)`)
 	asJSON := flag.Bool("json", false, "output JSON")
 	showForecast := flag.Bool("forecast", false, "also fetch the forecast")
+	at := flag.String("at", "", "show conditions as of a past time: RFC 3339, or local time as 2006-01-02T15:04[:05] (a space instead of T works too)")
 	base := flag.String("base-url", "", "override NWS base URL")
 	timeout := flag.Duration("timeout", 60*time.Second, "overall timeout")
 	flag.Usage = func() {
@@ -50,6 +56,15 @@ func main() {
 		os.Exit(2)
 	}
 
+	var atTime time.Time
+	if *at != "" {
+		var err error
+		if atTime, err = parseAt(*at); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(2)
+		}
+	}
+
 	c, err := weather.NewClient(&weather.Options{UserAgent: *ua, BaseURL: *base})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -57,7 +72,12 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	obs, err := c.Current(ctx, lat, lon)
+	var obs []weather.Observation
+	if !atTime.IsZero() {
+		obs, err = c.At(ctx, lat, lon, atTime)
+	} else {
+		obs, err = c.Current(ctx, lat, lon)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -85,6 +105,9 @@ func main() {
 	}
 
 	now := time.Now()
+	if !atTime.IsZero() {
+		now = atTime
+	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tNAME\tKM\tELEV M\tAGE\tTEMP C\tWIND KM/H\tPRESSURE HPA\tPRECIP 1/6/24H MM\tHUMIDITY %\tDESCRIPTION")
 	for _, o := range obs {
@@ -121,6 +144,19 @@ func main() {
 		printPeriod(tw, "hourly", p)
 	}
 	tw.Flush()
+}
+
+// parseAt reads a time as RFC 3339, or as a local time without a zone.
+func parseAt(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	for _, layout := range []string{"2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02 15:04:05"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("-at %q: use RFC 3339 (2026-11-22T08:30:00-05:00) or local time (2026-11-22T08:30)", s)
 }
 
 func printPeriod(tw *tabwriter.Writer, name string, p weather.Period) {

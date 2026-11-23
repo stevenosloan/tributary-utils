@@ -1,9 +1,10 @@
-// Package weather fetches current conditions and forecasts for a point from
-// the US National Weather Service (NWS) API.
+// Package weather fetches current conditions, conditions at a past time within
+// the last 7 days, and forecasts for a point from the US National Weather
+// Service (NWS) API.
 //
-// Current conditions come from the weather stations nearest the point, not
-// from the point itself, so each Observation says which station it is from and
-// how far away that is. Forecasts are for the point's cell on the NWS grid.
+// Conditions come from the weather stations nearest the point, not from the
+// point itself, so each Observation says which station it is from and how far
+// away that is. Forecasts are for the point's cell on the NWS grid.
 package weather
 
 import (
@@ -29,16 +30,39 @@ const DefaultBaseURL = "https://api.weather.gov"
 // maxStationKm is how far from the point a station may be to be considered.
 const maxStationKm = 50
 
-// maxStations caps how many stations Current returns.
+// maxStations caps how many stations Current and At return.
 const maxStations = 3
 
 // maxAge is how old a station's newest observation may be before the station
 // is skipped as not reporting.
 const maxAge = 2 * time.Hour
 
-// lookback is how much observation history is requested per station: enough
-// for 24 hourly reports ending up to two hours ago.
+// lookback is how much observation history is requested per station before the
+// time asked about. It is sized for the longest value derived from the reports,
+// the 24 hour rain total, which needs 24 routine hourly reports ending up to
+// two hours (maxAge) before that time: 26 hours. The others need less: picking
+// the report to use looks back 2 hours, the pressure trend about 5.5 hours (the
+// chosen report up to 2 hours back, then 3 hours more, within 30 minutes), and
+// the 6 hour rain total about 8 hours.
 const lookback = 26 * time.Hour
+
+// historyLimit is how far back At can look. NWS keeps 7 days of reports
+// (verified 2026-11-23: the oldest report returned was 7 days old to the
+// minute, and windows older than that return nothing).
+const historyLimit = 7 * 24 * time.Hour
+
+// clockSkew is how far ahead of the current time At accepts a time, treating it
+// as now.
+const clockSkew = time.Minute
+
+// settleTime is how long after an hour ends its reports are taken to be final.
+// NWS can publish a report before parsing its values, so a window isn't
+// treated as settled the moment its hour ends.
+const settleTime = time.Hour
+
+// pastObservationTTL is how long At keeps a settled hour's reports, which no
+// longer change.
+const pastObservationTTL = time.Hour
 
 // batchSize is how many candidate stations are queried at once. A batch that
 // doesn't yield maxStations fresh stations is followed by the next nearest.
@@ -68,6 +92,10 @@ const steadyHPa = 1.0
 // Problem" instead (seen at 30, -60), which comes back as an ordinary *Error
 // with Status 500 and does not match ErrNoCoverage. Test with errors.Is.
 var ErrNoCoverage = errors.New("point is outside NWS coverage")
+
+// ErrTooOld is returned by At for a time more than 7 days before now, older
+// than the reports NWS keeps. Test with errors.Is.
+var ErrTooOld = errors.New("time is older than the 7 days of reports NWS keeps")
 
 // Error reports a failed request to the NWS API.
 type Error struct {
@@ -248,6 +276,57 @@ func NewClient(opts *Options) (*Client, error) {
 // (the newest report's age, precipitation totals, pressure trend) is worked
 // out on each call against the current time.
 func (c *Client) Current(ctx context.Context, lat, lon float64) ([]Observation, error) {
+	return c.nearby(ctx, lat, lon, c.now, c.observations)
+}
+
+// At returns what Current would have returned at time t: the observation from
+// up to three weather stations near the point, nearest first, as of t. Only
+// stations within 50 km are considered, and a station is skipped unless its
+// newest report at or before t is under two hours older than t. Reports after
+// t are ignored, and the precipitation totals and pressure trend are worked out
+// as of t. An empty result isn't an error. A point outside NWS coverage gives
+// an *Error wrapping ErrNoCoverage.
+//
+// NWS keeps about 7 days of reports. A t more than 7 days before now gives
+// ErrTooOld, without any request; one near that edge is allowed, but its
+// 24 hour totals will show the missing hours. A t after now is an error, except
+// within a minute of it (for clock skew), which is taken as now.
+//
+// Stations are chosen and queried as in Current, with the same handling of
+// failed stations. Each station's reports from 26 hours before the start of
+// t's UTC hour to the end of it are fetched once and cached for
+// Options.ObservationTTL, so calls for times in the same hour share one request
+// per station.
+func (c *Client) At(ctx context.Context, lat, lon float64, t time.Time) ([]Observation, error) {
+	now := c.now()
+	switch {
+	case now.Sub(t) > historyLimit:
+		return nil, ErrTooOld
+	case t.After(now.Add(clockSkew)):
+		return nil, fmt.Errorf("weather: time %s is in the future", t.UTC().Format(time.RFC3339))
+	case t.After(now):
+		t = now
+	}
+	hour := t.UTC().Truncate(time.Hour)
+	fetch := func(ctx context.Context, id string) ([]report, error) {
+		rs, err := c.observationsIn(ctx, id, hour)
+		if err != nil {
+			return nil, err
+		}
+		// Newest first, so drop the reports after t from the front.
+		i := 0
+		for i < len(rs) && rs[i].T.After(t) {
+			i++
+		}
+		return rs[i:], nil
+	}
+	return c.nearby(ctx, lat, lon, func() time.Time { return t }, fetch)
+}
+
+// nearby is the station selection shared by Current and At. fetch returns a
+// station's reports, newest first, and now gives the time to evaluate them at.
+func (c *Client) nearby(ctx context.Context, lat, lon float64, now func() time.Time,
+	fetch func(ctx context.Context, id string) ([]report, error)) ([]Observation, error) {
 	info, err := c.point(ctx, lat, lon)
 	if err != nil {
 		return nil, err
@@ -282,12 +361,12 @@ func (c *Client) Current(ctx context.Context, lat, lon float64) ([]Observation, 
 		fns := make([]func(context.Context) error, len(batch))
 		for i, b := range batch {
 			fns[i] = func(ctx context.Context) error {
-				reports, err := c.observations(ctx, b.st.ID)
+				reports, err := fetch(ctx, b.st.ID)
 				if err != nil {
 					errs[i] = err
 					return nil
 				}
-				got[i] = summarize(b.st, b.km, reports, c.now())
+				got[i] = summarize(b.st, b.km, reports, now())
 				return nil
 			}
 		}
@@ -663,7 +742,7 @@ func (c *Client) observations(ctx context.Context, id string) ([]report, error) 
 	if c.cacheGet(ctx, key, c.obsTTL, &rs) && len(rs) > 0 {
 		return rs, nil
 	}
-	rs, err := c.fetchObservations(ctx, id)
+	rs, err := c.fetchObservations(ctx, id, c.now().Add(-lookback), time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -673,12 +752,45 @@ func (c *Client) observations(ctx context.Context, id string) ([]report, error) 
 	return rs, nil
 }
 
-// fetchObservations requests a station's recent reports, newest first.
-// 500 is the most NWS returns per request; it covers the 26 hour lookback even
-// at a 5-minute cadence (about 312 reports), so pagination links are ignored.
-func (c *Client) fetchObservations(ctx context.Context, id string) ([]report, error) {
-	start := c.now().Add(-lookback).UTC().Format(time.RFC3339)
-	u := c.base + "/stations/" + url.PathEscape(id) + "/observations?limit=500&start=" + url.QueryEscape(start)
+// observationsIn returns a station's reports from lookback before the start of
+// the UTC hour to the end of it, newest first, from the cache or from NWS. The
+// window depends only on the hour, so every time within it shares the entry.
+//
+// A window that may still gain reports is cached for ObservationTTL, like
+// Current's. Once its hour ended more than settleTime ago it no longer
+// changes, so it is kept for pastObservationTTL instead (if ObservationTTL is
+// longer, that is used).
+func (c *Client) observationsIn(ctx context.Context, id string, hour time.Time) ([]report, error) {
+	key := c.cacheKey("obsat", id+":"+hour.Format(time.RFC3339))
+	ttl := c.obsTTL
+	if ttl > 0 && c.now().Sub(hour.Add(time.Hour)) > settleTime {
+		ttl = max(ttl, pastObservationTTL)
+	}
+	var rs []report
+	if c.cacheGet(ctx, key, ttl, &rs) && len(rs) > 0 {
+		return rs, nil
+	}
+	rs, err := c.fetchObservations(ctx, id, hour.Add(-lookback), hour.Add(time.Hour))
+	if err != nil {
+		return nil, err
+	}
+	if len(rs) > 0 {
+		c.cacheSet(ctx, key, rs, ttl)
+	}
+	return rs, nil
+}
+
+// fetchObservations requests a station's recent reports, newest first. With a
+// zero end the window is open-ended, from lookback before now.
+// 500 is the most NWS returns per request; it covers a 26 or 27 hour window
+// even at a 5-minute cadence (about 312 to 324 reports), so pagination links
+// are ignored.
+func (c *Client) fetchObservations(ctx context.Context, id string, start, end time.Time) ([]report, error) {
+	u := c.base + "/stations/" + url.PathEscape(id) + "/observations?limit=500&start=" +
+		url.QueryEscape(start.UTC().Format(time.RFC3339))
+	if !end.IsZero() {
+		u += "&end=" + url.QueryEscape(end.UTC().Format(time.RFC3339))
+	}
 	var doc struct {
 		Features []struct {
 			Properties obsProps `json:"properties"`
