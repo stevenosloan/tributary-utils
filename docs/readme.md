@@ -18,7 +18,7 @@ utils/
 │   ├── gauges/      # CLI: table/JSON output, -svg to draw
 │   ├── modelflow/   # CLI: model flow for a COMID or a point
 │   ├── flowcheck/   # CLI: record NWM forecasts, score them against gauges
-│   └── weather/     # CLI: stations table, -forecast, -json
+│   └── weather/     # CLI: stations table, -at, -forecast, -json
 └── docs/            # you are here
 ```
 

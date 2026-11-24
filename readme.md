@@ -61,13 +61,14 @@ Details: [docs/readings.md](docs/readings.md).
 ## weather
 
 Current conditions from the National Weather Service stations nearest a
-point, with each station's distance and elevation, plus the forecast for the
-point. NWS is free and keyless but requires a `User-Agent` that identifies
+point, with each station's distance and elevation, the same conditions as of
+a past time within the last 7 days, and the forecast for the point. NWS is free and keyless but requires a `User-Agent` that identifies
 you.
 
 ```go
 c, err := weather.NewClient(&weather.Options{UserAgent: "(example.com, contact@example.com)"})
 obs, err := c.Current(ctx, 34.42, -84.22) // up to 3 stations, nearest first
+obs, err = c.At(ctx, 34.42, -84.22, t)     // as of t; weather.ErrTooOld past 7 days
 fc, err := c.Forecast(ctx, 34.42, -84.22) // 12-hour periods and the next 24 hours
 ```
 

@@ -1,8 +1,9 @@
 # weather
 
 `weather.Client.Current(ctx, lat, lon)` returns the latest conditions from the
-weather stations nearest a point, and `Forecast(ctx, lat, lon)` returns the
-forecast for it, both from the US National Weather Service (NWS).
+weather stations nearest a point, `At(ctx, lat, lon, t)` the conditions at a
+past time, and `Forecast(ctx, lat, lon)` the forecast for it, all from the US
+National Weather Service (NWS).
 
 ```go
 c, err := weather.NewClient(&weather.Options{UserAgent: "(example.com, contact@example.com)"})
@@ -35,7 +36,7 @@ The NWS API, `https://api.weather.gov` (`DefaultBaseURL`).
 |-----------------|---------|-------|
 | `points` | `GET /points/{lat},{lon}` | The point's forecast URLs, station list URL and time zone |
 | `stations` | `GET {observationStations}?limit=30` | Stations of the point's grid cell: id, name, location, elevation |
-| `observations` | `GET /stations/{id}/observations?limit=500&start=<now-26h>` | Recent reports of one station, newest first (500 is NWS's maximum and covers 26 hours of 5-minute reports; further pages are not followed) |
+| `observations` | `GET /stations/{id}/observations?limit=500&start=<now-26h>`; for `At`, with `&end=<end of t's hour>` and start 26 hours before the start of that hour | Recent reports of one station, newest first (500 is NWS's maximum and covers 26 to 27 hours of 5-minute reports; further pages are not followed) |
 | `forecast` | `GET {forecast}?units=si` | 12-hour periods, about 7 days |
 | `forecast-hourly` | `GET {forecastHourly}?units=si` | Hourly periods, about 7 days |
 
@@ -54,6 +55,7 @@ off, and a shared or remote store can be supplied. Values are JSON.
 | Grid data of a point: forecast URLs, station list URL, time zone | `points:<lat,lon>` | `PointTTL`, 24 hours (`DefaultPointTTL`) |
 | Stations of the point's grid cell | `stations:<stations URL>` | `PointTTL` |
 | Recent reports of one station (what `Current` reads) | `obs:<stationID>` | `ObservationTTL`, 5 minutes (`DefaultObservationTTL`) |
+| Reports of one station around an hour (what `At` reads) | `obsat:<stationID>:<hour>` | `ObservationTTL`; 1 hour once the hour ended more than an hour ago |
 | Daily forecast document of a grid cell | `forecast:<forecast URL>` | `ForecastTTL`, 15 minutes (`DefaultForecastTTL`) |
 | Hourly forecast document of a grid cell | `forecast-hourly:<hourly URL>` | `ForecastTTL` |
 
@@ -184,6 +186,51 @@ hours earlier, within 30 minutes either way, using the same measurement
 `steady`; otherwise it is `rising` or `falling`. With no such earlier report
 the trend is `""` and the change nil.
 
+## Past conditions
+
+`At(ctx, lat, lon, t)` returns what `Current` would have returned at time `t`,
+for example to describe the weather at the time a log entry was written later.
+It takes the same stations, in the same order, with the same fields and the
+same handling of failed stations.
+
+- A station is kept if its newest report **at or before `t`** is no more than
+  two hours older than `t`. Reports after `t` are ignored entirely.
+- The report used, the precipitation totals and the pressure trend are all
+  worked out as of `t`, as if `t` were now: rain after `t` doesn't count, and
+  the trend is measured over the 3 hours before the report used.
+- NWS keeps about 7 days of reports. A `t` more than 7 days before now returns
+  `ErrTooOld` (test with `errors.Is`) without making any request. A `t` near
+  that edge works, but its 24 hour totals will show missing hours.
+- A `t` after now is an error (a plain error, not `ErrTooOld`). A `t` less than
+  a minute ahead, to allow for clock skew, is taken as now.
+
+```go
+obs, err := c.At(ctx, 34.42, -84.22, time.Date(2026, 11, 22, 8, 30, 0, 0, loc))
+if errors.Is(err, weather.ErrTooOld) {
+	// older than NWS keeps
+}
+```
+
+### Window and caching
+
+For each station the client requests
+`/stations/{id}/observations?limit=500&start=<S>&end=<E>`, where `E` is the end
+of `t`'s UTC hour and `S` is 26 hours before the start of that hour, then drops
+the reports after `t`. The 26 hours are fixed: the 24 hour rain total needs 24
+routine hourly reports ending up to two hours before `t`. The report pick needs
+2 hours of history, the pressure trend about 5.5 hours and the 6 hour rain
+total about 8 hours.
+
+The window depends only on the hour, so it is cached per station and hour
+(`obsat:<stationID>:<hour, RFC 3339>`), and every `t` within that hour shares
+one request per station. While the hour may still gain reports, the entry is
+kept for `ObservationTTL`, so like `Current`, a `t` in the last few minutes
+can miss a report published since. Once the hour ended more than an hour ago
+(NWS can publish a report before parsing it), its reports no longer change and
+the entry is kept for an hour, or `ObservationTTL` if that's longer. A negative
+`ObservationTTL` turns this cache off too. As elsewhere, an empty result isn't
+cached.
+
 ## Forecast
 
 `Forecast` fetches both forecasts in parallel. The result has:
@@ -215,10 +262,15 @@ every uncovered point that way: for some open-ocean points it answers 500
 `*Error` with `Status` 500, not `ErrNoCoverage`, so don't read a 500 from
 `points` as an NWS outage without checking where the point is.
 
+`At` returns `ErrTooOld` for a time more than 7 days before now, and a plain
+error for one in the future.
+
 ## Limits
 
-- Observations are kept by NWS for about 7 days; the client only asks for 26
-  hours.
+- Observations are kept by NWS for about 7 days, which is how far back `At`
+  reaches; `Current` only asks for 26 hours.
+- Near the 7-day edge, `At`'s 24 hour totals show missing hours, as the reports
+  before that are gone.
 - Forecasts are for NWS's 2.5 km grid cell, not the exact point.
 - NWS applies undisclosed rate limits; a 429 or 503 means to back off.
 - Coverage is the US and its territories.
